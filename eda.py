@@ -5,6 +5,7 @@ import seaborn as sns
 from wordcloud import WordCloud
 from data_preprocessing import clean_text_series
 
+CUSTOM_STOPWORDS = {'u', 'inc', 'co', 'ltd', 'corp', 'group', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}
 
 def load_data(train_csv, valid_csv):
     df_train = pd.read_csv(train_csv)
@@ -24,7 +25,9 @@ def plot_sentiment_distribution(df, output_dir):
 
 
 def plot_word_frequency(df, text_col='text', top_n=20, output_dir=None):
-    all_words = df[text_col].str.split().explode()
+    all_words = df[text_col].str.lower().str.split().explode().dropna()
+    all_words = all_words[all_words.str.isalpha()]
+    all_words = all_words[~all_words.isin(CUSTOM_STOPWORDS)]
     freq = all_words.value_counts().nlargest(top_n)
     plt.figure(figsize=(8,6))
     sns.barplot(x=freq.values, y=freq.index)
@@ -50,7 +53,10 @@ def plot_ticker_frequency(df, top_n=20, output_dir=None):
 def plot_wordclouds(df, text_col='text', output_dir=None):
     for sentiment in df['label'].unique():
         text_series = df[df['label'] == sentiment][text_col]
-        word_freq = text_series.str.split().explode().value_counts()
+        word_series = text_series.str.lower().str.split().explode().dropna()
+        word_series = word_series[word_series.str.isalpha()]
+        word_series = word_series[~word_series.isin(CUSTOM_STOPWORDS)]
+        word_freq = word_series.value_counts()
         if word_freq.empty:
             continue
         wordcloud = WordCloud(width=800, height=400, background_color='white')
