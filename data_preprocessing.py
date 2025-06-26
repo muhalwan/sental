@@ -7,6 +7,7 @@ from transformers import BertTokenizer
 from imblearn.over_sampling import RandomOverSampler
 import nltk
 import emoji
+
 nltk.download('stopwords')
 from nltk.corpus import stopwords
 from sklearn.model_selection import train_test_split
@@ -31,7 +32,9 @@ def clean_text_series(series: pd.Series) -> pd.Series:
         def _rep(m):
             tk = m.group(0)
             return TICKER_MAP.get(tk, tk.strip('$'))
+
         return re.sub(r"\$[A-Za-z]{1,5}", _rep, text)
+
     series = series.apply(replace_ticker_in_text)
 
     series = series.str.replace(r"[^A-Za-z0-9(),!?\'`]", " ", regex=True)
@@ -39,6 +42,7 @@ def clean_text_series(series: pd.Series) -> pd.Series:
 
     def remove_stopwords(text):
         return ' '.join([tok for tok in text.split() if tok.lower() not in stop_words])
+
     series = series.apply(remove_stopwords)
     return series
 
@@ -69,26 +73,27 @@ class FinanceDataset(Dataset):
 
 
 def prepare_dataloaders(
-    train_csv,
-    valid_csv,
-    model_name='ProsusAI/finbert',
-    batch_size=32,
-    max_length=128,
-    test_size=0.1,
-    random_state=42
+        train_csv,
+        valid_csv,
+        model_name='ProsusAI/finbert',
+        batch_size=32,
+        max_length=128,
+        test_size=0.1,
+        random_state=42
 ):
     df_train = pd.read_csv(train_csv)
     df_valid = pd.read_csv(valid_csv)
     for df, name in [(df_train, 'Train'), (df_valid, 'Valid')]:
         if 'text' not in df.columns or 'label' not in df.columns:
             raise ValueError(f"{name} CSV must contain 'text' and 'label' columns")
-    
+
     tickers = extract_tickers(df_train['text'], df_valid['text'])
     TICKER_MAP.clear()
     TICKER_MAP.update({tk: tk.strip('$') for tk in sorted(tickers)})
 
-    df_train_main, df_test = train_test_split(df_train, test_size=test_size, stratify=df_train['label'], random_state=random_state)
-    
+    df_train_main, df_test = train_test_split(df_train, test_size=test_size, stratify=df_train['label'],
+                                              random_state=random_state)
+
     X_train_clean = clean_text_series(df_train_main['text'])
     y_train = df_train_main['label']
     X_valid_clean = clean_text_series(df_valid['text'])
@@ -104,7 +109,7 @@ def prepare_dataloaders(
     train_ds = FinanceDataset(X_train_res, y_res, tokenizer, max_length)
     valid_ds = FinanceDataset(X_valid_clean, y_valid, tokenizer, max_length)
     test_ds = FinanceDataset(X_test_clean, y_test, tokenizer, max_length)
-    
+
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     valid_dl = DataLoader(valid_ds, batch_size=batch_size)
     test_dl = DataLoader(test_ds, batch_size=batch_size)
@@ -116,4 +121,5 @@ if __name__ == '__main__':
     train_csv = os.path.join(base, 'dataset', 'sent_train.csv')
     valid_csv = os.path.join(base, 'dataset', 'sent_valid.csv')
     train_loader, valid_loader, test_loader = prepare_dataloaders(train_csv, valid_csv)
-    print(f"Train batches: {len(train_loader)} | Validation batches: {len(valid_loader)} | Test batches: {len(test_loader)}")
+    print(
+        f"Train batches: {len(train_loader)} | Validation batches: {len(valid_loader)} | Test batches: {len(test_loader)}")
