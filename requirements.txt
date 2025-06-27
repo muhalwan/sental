@@ -1,12 +1,12 @@
-pandas>=1.0
+pandas==1.5.3
 torch>=1.7.0
-transformers>=4.0.0
+transformers==4.43.3
 imbalanced-learn>=0.8.0
 scikit-learn>=0.24.0
 matplotlib==3.8.2
 seaborn>=0.11.0
 wordcloud==1.9.2
-nltk==3.8.1
+nltk==3.9
 emoji>=1.6.0
 numpy>=1.19.0
-tqdm==4.66.1
+tqdm==4.66.3

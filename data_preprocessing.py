@@ -2,9 +2,10 @@ import re
 import os
 import pandas as pd
 import torch
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer
-from imblearn.over_sampling import RandomOverSampler
+from sklearn.utils.class_weight import compute_class_weight
 import nltk
 import emoji
 
@@ -101,25 +102,28 @@ def prepare_dataloaders(
     X_test_clean = clean_text_series(df_test['text'])
     y_test = df_test['label']
 
-    ros = RandomOverSampler(random_state=random_state)
-    X_res, y_res = ros.fit_resample(X_train_clean.to_frame(name='text'), y_train)
-    X_train_res = X_res['text']
+    class_weights = compute_class_weight(
+        'balanced',
+        classes=np.unique(y_train),
+        y=y_train
+    )
+    class_weights = torch.tensor(class_weights, dtype=torch.float)
 
     tokenizer = BertTokenizer.from_pretrained(model_name)
-    train_ds = FinanceDataset(X_train_res, y_res, tokenizer, max_length)
+    train_ds = FinanceDataset(X_train_clean, y_train, tokenizer, max_length)
     valid_ds = FinanceDataset(X_valid_clean, y_valid, tokenizer, max_length)
     test_ds = FinanceDataset(X_test_clean, y_test, tokenizer, max_length)
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     valid_dl = DataLoader(valid_ds, batch_size=batch_size)
     test_dl = DataLoader(test_ds, batch_size=batch_size)
-    return train_dl, valid_dl, test_dl
+    return train_dl, valid_dl, test_dl, class_weights
 
 
 if __name__ == '__main__':
     base = os.path.dirname(__file__)
     train_csv = os.path.join(base, 'dataset', 'sent_train.csv')
     valid_csv = os.path.join(base, 'dataset', 'sent_valid.csv')
-    train_loader, valid_loader, test_loader = prepare_dataloaders(train_csv, valid_csv)
+    train_loader, valid_loader, test_loader, _ = prepare_dataloaders(train_csv, valid_csv)
     print(
         f"Train batches: {len(train_loader)} | Validation batches: {len(valid_loader)} | Test batches: {len(test_loader)}")
