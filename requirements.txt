@@ -5,7 +5,7 @@ imbalanced-learn>=0.8.0
 scikit-learn>=0.24.0
 matplotlib==3.8.2
 seaborn>=0.11.0
-wordcloud==1.9.2
+wordcloud==1.9.3
 nltk==3.9
 emoji>=1.6.0
 numpy>=1.19.0
