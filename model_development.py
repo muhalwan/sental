@@ -1,4 +1,5 @@
 import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import torch
 import numpy as np
 import pandas as pd
@@ -8,12 +9,13 @@ import time
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
 from transformers import BertForSequenceClassification, get_linear_schedule_with_warmup
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import label_binarize
 from wordcloud import WordCloud
 from data_preprocessing import prepare_dataloaders
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-
+import torch.nn.functional as F
 
 MODEL_NAME = 'ProsusAI/finbert'
 NUM_CLASSES = 3
@@ -50,8 +52,8 @@ def train_epoch(model, data_loader, loss_fn, optimizer, scheduler, scaler, accum
         if (i + 1) % accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
             scheduler.step()
+            optimizer.zero_grad()
             progress_bar.set_postfix({'loss': loss.item() * accumulation_steps})
 
     return total_loss / len(data_loader.dataset)
@@ -60,7 +62,7 @@ def train_epoch(model, data_loader, loss_fn, optimizer, scheduler, scaler, accum
 def eval_model(model, data_loader, loss_fn):
     model.eval()
     total_loss = 0
-    predictions, true_labels = [], []
+    predictions, true_labels, all_probs = [], [], []
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Evaluating"):
             input_ids = batch['input_ids'].to(DEVICE)
@@ -71,10 +73,12 @@ def eval_model(model, data_loader, loss_fn):
                 logits = outputs.logits
                 loss = loss_fn(logits, labels)
             total_loss += loss.item()
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            probs = F.softmax(logits, dim=1).cpu().numpy()
+            preds = np.argmax(probs, axis=1)
             predictions.extend(preds)
             true_labels.extend(labels.cpu().numpy())
-    return true_labels, predictions, total_loss / len(data_loader)
+            all_probs.extend(probs)
+    return true_labels, predictions, np.array(all_probs), total_loss / len(data_loader)
 
 
 def plot_visualizations(true_labels, predictions, output_dir):
@@ -92,6 +96,38 @@ def plot_visualizations(true_labels, predictions, output_dir):
     plt.close()
 
 
+def plot_roc_curves(true_labels, predictions_prob, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    true_labels_bin = label_binarize(true_labels, classes=[0, 1, 2])
+    n_classes = true_labels_bin.shape[1]
+
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+
+    for i in range(n_classes):
+        fpr[i], tpr[i], _ = roc_curve(true_labels_bin[:, i], predictions_prob[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    plt.figure(figsize=(10, 8))
+    colors = ['aqua', 'darkorange', 'cornflowerblue']
+    class_names = ['Bearish', 'Bullish', 'Neutral']
+    for i, color in zip(range(n_classes), colors):
+        plt.plot(fpr[i], tpr[i], color=color, lw=2,
+                 label='ROC curve of class {0} (area = {1:0.2f})'
+                 ''.format(class_names[i], roc_auc[i]))
+
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curves')
+    plt.legend(loc="lower right")
+    plt.savefig(os.path.join(output_dir, 'roc_curves.png'))
+    plt.close()
+
+
 def generate_wordclouds(texts, labels, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     df = pd.DataFrame({'text': texts, 'label': labels})
@@ -105,6 +141,29 @@ def generate_wordclouds(texts, labels, output_dir):
         plt.axis('off')
         plt.title(f'Word Cloud for {name} Sentiment')
         plt.savefig(os.path.join(output_dir, f'wordcloud_{name}.png'))
+        plt.close()
+
+
+def visualize_attention(model, tokenizer, sentences, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+
+    for i, sentence in enumerate(sentences):
+        inputs = tokenizer(sentence, return_tensors='pt', truncation=True, max_length=MAX_LENGTH).to(DEVICE)
+
+        with torch.no_grad():
+            outputs = model(**inputs, output_attentions=True)
+
+        attentions = outputs.attentions[-1]
+        attention = torch.mean(attentions, dim=1).squeeze(0)
+        tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(attention.cpu().numpy(), xticklabels=tokens, yticklabels=tokens, cmap='viridis')
+        plt.title(f'Attention Heatmap for: "{sentence[:50]}..."')
+        plt.xticks(rotation=90)
+        plt.yticks(rotation=0)
+        plt.savefig(os.path.join(output_dir, f'attention_heatmap_{i+1}.png'), bbox_inches='tight')
         plt.close()
 
 
@@ -140,7 +199,7 @@ if __name__ == '__main__':
         avg_train_loss = train_epoch(model, train_dl, loss_fn, optimizer, scheduler, scaler, ACCUMULATION_STEPS)
         print(f'Training loss: {avg_train_loss}')
 
-        true_labels, predictions, avg_val_loss = eval_model(model, valid_dl, loss_fn)
+        true_labels, predictions, _, avg_val_loss = eval_model(model, valid_dl, loss_fn)
         accuracy = accuracy_score(true_labels, predictions)
         elapsed_time = time.time() - start_time
         print(f'Validation Accuracy: {accuracy:.4f}, Validation Loss: {avg_val_loss:.4f} | Time: {elapsed_time // 60:.0f}m {elapsed_time % 60:.0f}s')
@@ -165,10 +224,19 @@ if __name__ == '__main__':
     print("\nLoading best model for final evaluation on test set...")
     model = BertForSequenceClassification.from_pretrained(os.path.join(OUTPUT_DIR, 'fine_tuned_model'), use_safetensors=True).to(DEVICE)
 
-    true_labels, predictions, _ = eval_model(model, test_dl, loss_fn)
+    true_labels, predictions, probs, _ = eval_model(model, test_dl, loss_fn)
     plot_visualizations(true_labels, predictions, OUTPUT_DIR)
+    plot_roc_curves(true_labels, probs, OUTPUT_DIR)
 
     test_texts = [test_dl.dataset.texts.iloc[i] for i in range(len(test_dl.dataset))]
     generate_wordclouds(test_texts, predictions, OUTPUT_DIR)
+
+    print("\nGenerating attention visualizations for sample texts...")
+    sample_texts = [
+        "BTIG points to breakfast pressure for Dunkin' Brands",
+        "$CX - Cemex cut at Credit Suisse, J.P. Morgan on weak building outlook",
+        "Adobe price target raised to $350 vs. $320 at Canaccord"
+    ]
+    visualize_attention(model, test_dl.dataset.tokenizer, sample_texts, OUTPUT_DIR)
 
     print(f"\nModel and visualizations saved in '{OUTPUT_DIR}' directory.")
