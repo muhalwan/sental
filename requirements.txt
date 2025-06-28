@@ -1,14 +1,6 @@
-pandas==1.5.3
-torch>=1.7.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 transformers==4.50.0
-imbalanced-learn>=0.8.0
-scikit-learn>=0.24.0
-matplotlib==3.8.2
-seaborn>=0.11.0
-wordcloud==1.9.3
-nltk==3.9
-emoji>=1.6.0
-numpy>=1.19.0
-tqdm==4.66.3
 streamlit==1.36.0
 gunicorn==22.0.0
+sentencepiece
