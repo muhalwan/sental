@@ -10,3 +10,5 @@ nltk==3.9
 emoji>=1.6.0
 numpy>=1.19.0
 tqdm==4.66.3
+streamlit==1.36.0
+gunicorn==22.0.0
