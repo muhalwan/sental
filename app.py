@@ -14,14 +14,9 @@ if st.button("Analyze"):
     if text:
         with st.spinner("Analyzing..."):
             prediction, probabilities = predict_sentiment(text)
-            st.write(f"Prediction: **{prediction}**")
-            st.write("Probabilities:")
-            st.write(f"- Bullish: {probabilities['Bullish']:.4f}")
-            st.write(f"- Bearish: {probabilities['Bearish']:.4f}")
-            st.write(f"- Neutral: {probabilities['Neutral']:.4f}")
-
-            st.subheader("Sentiment Distribution")
-            st.bar_chart(probabilities)
+            probability_value = probabilities[prediction]
+            st.write(f"Prediction: {prediction.lower()}")
+            st.write(f"Probability: {probability_value:.0%}")
 
     else:
         st.warning("Please enter some text to analyze.")
