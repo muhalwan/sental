@@ -1,8 +1,21 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch.nn.functional as F
+import os
+from huggingface_hub import snapshot_download
 
 model_path = './model_outputs/fine_tuned_model'
+
+MODEL_URL = os.getenv('MODEL_URL')
+
+if not os.path.exists(model_path) and MODEL_URL:
+    print(f"Model not found locally. Downloading from {MODEL_URL}...")
+    # Use snapshot_download to download the model repository
+    snapshot_download(repo_id=MODEL_URL, local_dir=model_path, repo_type='model')
+    print("Model downloaded successfully.")
+elif not os.path.exists(model_path):
+    raise ValueError("Model not found locally and MODEL_URL environment variable is not set.")
+
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
 

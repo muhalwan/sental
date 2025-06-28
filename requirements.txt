@@ -4,3 +4,4 @@ transformers==4.50.0
 streamlit==1.36.0
 gunicorn==22.0.0
 sentencepiece
+huggingface-hub==0.24.1
