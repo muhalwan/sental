@@ -10,7 +10,6 @@ MODEL_URL = os.getenv('MODEL_URL')
 
 if not os.path.exists(model_path) and MODEL_URL:
     print(f"Model not found locally. Downloading from {MODEL_URL}...")
-    # Use snapshot_download to download the model repository
     snapshot_download(repo_id=MODEL_URL, local_dir=model_path, repo_type='model')
     print("Model downloaded successfully.")
 elif not os.path.exists(model_path):
