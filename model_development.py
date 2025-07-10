@@ -1,5 +1,7 @@
 import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import torch
 import numpy as np
 import pandas as pd
@@ -16,16 +18,18 @@ from data_preprocessing import prepare_dataloaders
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import torch.nn.functional as F
+import optuna
 
 MODEL_NAME = 'ProsusAI/finbert'
 NUM_CLASSES = 3
 EPOCHS = 10
 BATCH_SIZE = 16
-ACCUMULATION_STEPS = 4
+ACCUMULATION_STEPS = 8
 MAX_LENGTH = 256
 LEARNING_RATE = 3e-5
 OUTPUT_DIR = 'model_outputs'
 EARLY_STOPPING_PATIENCE = 3
+N_TRIALS = 15
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -52,8 +56,8 @@ def train_epoch(model, data_loader, loss_fn, optimizer, scheduler, scaler, accum
         if (i + 1) % accumulation_steps == 0:
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             optimizer.zero_grad()
+            scheduler.step()
             progress_bar.set_postfix({'loss': loss.item() * accumulation_steps})
 
     return total_loss / len(data_loader.dataset)
@@ -79,6 +83,50 @@ def eval_model(model, data_loader, loss_fn):
             true_labels.extend(labels.cpu().numpy())
             all_probs.extend(probs)
     return true_labels, predictions, np.array(all_probs), total_loss / len(data_loader)
+
+
+def objective(trial, train_csv, valid_csv):
+    LEARNING_RATE = trial.suggest_float("lr", 1e-6, 1e-4, log=True)
+    BATCH_SIZE = trial.suggest_categorical("batch_size", [4, 8])
+
+    train_dl, valid_dl, _, class_weights = prepare_dataloaders(
+        train_csv, valid_csv, MODEL_NAME, BATCH_SIZE, MAX_LENGTH
+    )
+
+    class_weights = class_weights.to(DEVICE)
+    loss_fn = CrossEntropyLoss(weight=class_weights)
+
+    model = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_CLASSES).to(DEVICE)
+    model.gradient_checkpointing_enable()
+
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+    total_steps = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
+    warmup_steps = int(total_steps * 0.1)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+    scaler = GradScaler()
+
+    torch.cuda.empty_cache()
+
+    best_accuracy = 0
+    for epoch in range(EPOCHS):
+        train_epoch(model, train_dl, loss_fn, optimizer, scheduler, scaler, ACCUMULATION_STEPS)
+        true_labels, predictions, _, _ = eval_model(model, valid_dl, loss_fn)
+        accuracy = accuracy_score(true_labels, predictions)
+
+        trial.report(accuracy, epoch)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+
+        if epoch > EARLY_STOPPING_PATIENCE and accuracy < best_accuracy:
+             break
+
+    del model, optimizer, scheduler, scaler, train_dl, valid_dl, class_weights
+    torch.cuda.empty_cache()
+
+    return best_accuracy
 
 
 def plot_visualizations(true_labels, predictions, output_dir):
@@ -172,6 +220,23 @@ if __name__ == '__main__':
     train_csv = os.path.join(base, 'dataset', 'sent_train.csv')
     valid_csv = os.path.join(base, 'dataset', 'sent_valid.csv')
 
+    print("Starting hyperparameter optimization with Optuna...")
+    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())
+    study.optimize(lambda trial: objective(trial, train_csv, valid_csv), n_trials=N_TRIALS)
+
+    print("\nOptimization finished.")
+    print("Best trial:")
+    best_trial = study.best_trial
+    print(f"  Value (Validation Accuracy): {best_trial.value:.4f}")
+    print("  Params: ")
+    for key, value in best_trial.params.items():
+        print(f"    {key}: {value}")
+
+    print("\nStarting final training with the best hyperparameters...")
+    best_params = best_trial.params
+    LEARNING_RATE = best_params['lr']
+    BATCH_SIZE = best_params['batch_size']
+
     train_dl, valid_dl, test_dl, class_weights = prepare_dataloaders(
         train_csv, valid_csv, MODEL_NAME, BATCH_SIZE, MAX_LENGTH
     )
@@ -222,7 +287,31 @@ if __name__ == '__main__':
     print(f"Total training time: {elapsed_time // 60:.0f}m {elapsed_time % 60:.0f}s")
 
     print("\nLoading best model for final evaluation on test set...")
-    model = BertForSequenceClassification.from_pretrained(os.path.join(OUTPUT_DIR, 'fine_tuned_model'), use_safetensors=True).to(DEVICE)
+    model = BertForSequenceClassification.from_pretrained(os.path.join(OUTPUT_DIR, 'fine_tuned_model')).to(DEVICE)
+
+    model.config.to_json_file(os.path.join(OUTPUT_DIR, 'config.json'))
+    model.save_pretrained(OUTPUT_DIR)
+
+    print("\nConverting model to ONNX format...")
+    onnx_path = os.path.join(OUTPUT_DIR, 'model.onnx')
+    dummy_input = torch.zeros(1, MAX_LENGTH, dtype=torch.long).to(DEVICE)
+    dummy_attention_mask = torch.zeros(1, MAX_LENGTH, dtype=torch.long).to(DEVICE)
+
+    torch.onnx.export(
+        model,
+        (dummy_input, dummy_attention_mask),
+        onnx_path,
+        input_names=['input_ids', 'attention_mask'],
+        output_names=['logits'],
+        dynamic_axes={
+            'input_ids': {0: 'batch_size', 1: 'sequence'},
+            'attention_mask': {0: 'batch_size', 1: 'sequence'},
+            'logits': {0: 'batch_size'}
+        },
+        opset_version=14,
+        export_params=True
+    )
+    print(f"ONNX model saved to {onnx_path}")
 
     true_labels, predictions, probs, _ = eval_model(model, test_dl, loss_fn)
     plot_visualizations(true_labels, predictions, OUTPUT_DIR)

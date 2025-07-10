@@ -9,7 +9,6 @@ from sklearn.utils.class_weight import compute_class_weight
 import nltk
 import emoji
 
-nltk.download('stopwords')
 from nltk.corpus import stopwords
 from sklearn.model_selection import train_test_split
 

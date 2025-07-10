@@ -4,20 +4,15 @@ import torch.nn.functional as F
 import os
 from huggingface_hub import snapshot_download
 
-# The local path where the model will be stored
 local_model_dir = './model_outputs/fine_tuned_model'
 
-# Get the model repo ID from the environment variable
 MODEL_REPO_ID = os.getenv('MODEL_URL')
 
-# Use the local directory as the default model path
 model_path = local_model_dir
 
-# Download the model from the repo if a key file doesn't exist locally
 if not os.path.exists(os.path.join(local_model_dir, "model.safetensors")):
     if MODEL_REPO_ID:
         print(f"Model not found locally. Downloading from {MODEL_REPO_ID}...")
-        # Use snapshot_download and get the actual path, disabling symlinks for compatibility
         model_path = snapshot_download(
             repo_id=MODEL_REPO_ID,
             local_dir=local_model_dir,
