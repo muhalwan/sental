@@ -8,12 +8,79 @@ from transformers import BertTokenizer
 from sklearn.utils.class_weight import compute_class_weight
 import nltk
 import emoji
+import random
+from typing import List, Optional
 
 from nltk.corpus import stopwords
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 TICKER_MAP = {}
 stop_words = set(stopwords.words('english'))
+
+class TextAugmentation:
+    def __init__(self, augment_prob=0.3):
+        self.augment_prob = augment_prob
+        self.synonyms = {
+            'bullish': ['positive', 'optimistic', 'upbeat', 'favorable'],
+            'bearish': ['negative', 'pessimistic', 'downbeat', 'unfavorable'],
+            'increased': ['rose', 'climbed', 'advanced', 'gained'],
+            'decreased': ['fell', 'dropped', 'declined', 'lost'],
+            'strong': ['robust', 'solid', 'firm', 'stable'],
+            'weak': ['fragile', 'unstable', 'poor', 'soft']
+        }
+    
+    def synonym_replacement(self, text: str, n: int = 1) -> str:
+        words = text.split()
+        new_words = words.copy()
+        
+        for _ in range(n):
+            synonyms_found = []
+            for i, word in enumerate(words):
+                if word.lower() in self.synonyms:
+                    synonyms_found.append((i, word.lower()))
+            
+            if synonyms_found:
+                idx, word = random.choice(synonyms_found)
+                synonym = random.choice(self.synonyms[word])
+                new_words[idx] = synonym
+        
+        return ' '.join(new_words)
+    
+    def random_deletion(self, text: str, p: float = 0.1) -> str:
+        words = text.split()
+        if len(words) == 1:
+            return text
+        
+        new_words = []
+        for word in words:
+            if random.random() > p:
+                new_words.append(word)
+        
+        return ' '.join(new_words) if new_words else text
+    
+    def random_swap(self, text: str, n: int = 1) -> str:
+        words = text.split()
+        if len(words) < 2:
+            return text
+        
+        for _ in range(n):
+            idx1, idx2 = random.sample(range(len(words)), 2)
+            words[idx1], words[idx2] = words[idx2], words[idx1]
+        
+        return ' '.join(words)
+    
+    def augment_text(self, text: str) -> str:
+        if random.random() > self.augment_prob:
+            return text
+        
+        aug_type = random.choice(['synonym', 'deletion', 'swap'])
+        
+        if aug_type == 'synonym':
+            return self.synonym_replacement(text, n=random.randint(1, 2))
+        elif aug_type == 'deletion':
+            return self.random_deletion(text, p=0.1)
+        else:
+            return self.random_swap(text, n=1)
 
 
 def extract_tickers(*series_list, pattern=r"\$[A-Za-z]{1,5}"):
@@ -48,17 +115,21 @@ def clean_text_series(series: pd.Series) -> pd.Series:
 
 
 class FinanceDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length=128):
+    def __init__(self, texts, labels, tokenizer, max_length=128, augment_prob=0.3):
         self.texts = texts.reset_index(drop=True)
         self.labels = labels.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.augment_prob = augment_prob
+        self.augmenter = TextAugmentation(augment_prob=augment_prob)
 
     def __len__(self):
         return len(self.texts)
 
     def __getitem__(self, idx):
         text = self.texts.iloc[idx]
+        if random.random() < self.augment_prob:
+            text = self.augmenter.augment_text(text)
         encoding = self.tokenizer(
             text,
             add_special_tokens=True,
@@ -79,7 +150,8 @@ def prepare_dataloaders(
         batch_size=32,
         max_length=128,
         test_size=0.1,
-        random_state=42
+        random_state=42,
+        augment_prob=0.3
 ):
     df_train = pd.read_csv(train_csv)
     df_valid = pd.read_csv(valid_csv)
@@ -109,9 +181,9 @@ def prepare_dataloaders(
     class_weights = torch.tensor(class_weights, dtype=torch.float)
 
     tokenizer = BertTokenizer.from_pretrained(model_name)
-    train_ds = FinanceDataset(X_train_clean, y_train, tokenizer, max_length)
-    valid_ds = FinanceDataset(X_valid_clean, y_valid, tokenizer, max_length)
-    test_ds = FinanceDataset(X_test_clean, y_test, tokenizer, max_length)
+    train_ds = FinanceDataset(X_train_clean, y_train, tokenizer, max_length, augment_prob)
+    valid_ds = FinanceDataset(X_valid_clean, y_valid, tokenizer, max_length, augment_prob)
+    test_ds = FinanceDataset(X_test_clean, y_test, tokenizer, max_length, augment_prob)
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     valid_dl = DataLoader(valid_ds, batch_size=batch_size)

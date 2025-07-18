@@ -13,25 +13,34 @@ from torch.optim import AdamW
 from transformers import BertForSequenceClassification, get_linear_schedule_with_warmup
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc
 from sklearn.preprocessing import label_binarize
+from sklearn.model_selection import StratifiedKFold
 from wordcloud import WordCloud
 from data_preprocessing import prepare_dataloaders
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import torch.nn.functional as F
 import optuna
+import logging
+import json
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 MODEL_NAME = 'ProsusAI/finbert'
 NUM_CLASSES = 3
-EPOCHS = 10
+EPOCHS = 15
 BATCH_SIZE = 16
-ACCUMULATION_STEPS = 8
+ACCUMULATION_STEPS = 4
 MAX_LENGTH = 256
 LEARNING_RATE = 3e-5
 OUTPUT_DIR = 'model_outputs'
-EARLY_STOPPING_PATIENCE = 3
-N_TRIALS = 15
+EARLY_STOPPING_PATIENCE = 5
+N_TRIALS = 25
+USE_CROSS_VALIDATION = True
+N_FOLDS = 5
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+logger.info(f"Using device: {DEVICE}")
 
 
 def train_epoch(model, data_loader, loss_fn, optimizer, scheduler, scaler, accumulation_steps):
@@ -86,47 +95,141 @@ def eval_model(model, data_loader, loss_fn):
 
 
 def objective(trial, train_csv, valid_csv):
+    # Expanded hyperparameter space
     LEARNING_RATE = trial.suggest_float("lr", 1e-6, 1e-4, log=True)
-    BATCH_SIZE = trial.suggest_categorical("batch_size", [4, 8])
+    BATCH_SIZE = trial.suggest_categorical("batch_size", [8, 16, 32])
+    ACCUMULATION_STEPS = trial.suggest_categorical("accumulation_steps", [2, 4, 8])
+    WEIGHT_DECAY = trial.suggest_float("weight_decay", 0.0, 0.1)
+    WARMUP_RATIO = trial.suggest_float("warmup_ratio", 0.05, 0.2)
+    DROPOUT_RATE = trial.suggest_float("dropout_rate", 0.1, 0.5)
+    AUGMENT_PROB = trial.suggest_float("augment_prob", 0.0, 0.5)
+    
+    logger.info(f"Trial {trial.number}: LR={LEARNING_RATE:.2e}, BS={BATCH_SIZE}, "
+                f"WD={WEIGHT_DECAY:.3f}, Warmup={WARMUP_RATIO:.3f}, Dropout={DROPOUT_RATE:.3f}")
 
-    train_dl, valid_dl, _, class_weights = prepare_dataloaders(
-        train_csv, valid_csv, MODEL_NAME, BATCH_SIZE, MAX_LENGTH
-    )
+    if USE_CROSS_VALIDATION:
+        df_train = pd.read_csv(train_csv)
+        kf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+        cv_scores = []
+        
+        for fold, (train_idx, val_idx) in enumerate(kf.split(df_train, df_train['label'])):
+            logger.info(f"  Fold {fold + 1}/{N_FOLDS}")
+            
+            train_fold_df = df_train.iloc[train_idx].reset_index(drop=True)
+            valid_fold_df = df_train.iloc[val_idx].reset_index(drop=True)
+            
+            train_fold_csv = f'temp_train_fold_{fold}.csv'
+            valid_fold_csv = f'temp_valid_fold_{fold}.csv'
+            train_fold_df.to_csv(train_fold_csv, index=False)
+            valid_fold_df.to_csv(valid_fold_csv, index=False)
+            
+            try:
+                train_dl, valid_dl, _, class_weights = prepare_dataloaders(
+                    train_fold_csv, valid_fold_csv, MODEL_NAME, BATCH_SIZE, MAX_LENGTH, 
+                    augment_prob=AUGMENT_PROB
+                )
 
-    class_weights = class_weights.to(DEVICE)
-    loss_fn = CrossEntropyLoss(weight=class_weights)
+                class_weights = class_weights.to(DEVICE)
+                loss_fn = CrossEntropyLoss(weight=class_weights)
 
-    model = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_CLASSES).to(DEVICE)
-    model.gradient_checkpointing_enable()
+                model = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_CLASSES).to(DEVICE)
+                model.gradient_checkpointing_enable()
+                
+                if hasattr(model.config, 'hidden_dropout_prob'):
+                    model.config.hidden_dropout_prob = DROPOUT_RATE
+                    model.config.attention_probs_dropout_prob = DROPOUT_RATE
 
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
-    total_steps = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
-    warmup_steps = int(total_steps * 0.1)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
-    scaler = GradScaler()
+                optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+                total_steps = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
+                warmup_steps = int(total_steps * WARMUP_RATIO)
+                scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+                scaler = GradScaler()
 
-    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
 
-    best_accuracy = 0
-    for epoch in range(EPOCHS):
-        train_epoch(model, train_dl, loss_fn, optimizer, scheduler, scaler, ACCUMULATION_STEPS)
-        true_labels, predictions, _, _ = eval_model(model, valid_dl, loss_fn)
-        accuracy = accuracy_score(true_labels, predictions)
+                best_accuracy = 0
+                no_improve_count = 0
+                
+                for epoch in range(EPOCHS):
+                    train_epoch(model, train_dl, loss_fn, optimizer, scheduler, scaler, ACCUMULATION_STEPS)
+                    true_labels, predictions, _, _ = eval_model(model, valid_dl, loss_fn)
+                    accuracy = accuracy_score(true_labels, predictions)
 
-        trial.report(accuracy, epoch)
-        if trial.should_prune():
-            raise optuna.exceptions.TrialPruned()
+                    if accuracy > best_accuracy:
+                        best_accuracy = accuracy
+                        no_improve_count = 0
+                    else:
+                        no_improve_count += 1
 
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
+                    if no_improve_count >= EARLY_STOPPING_PATIENCE:
+                        logger.info(f"    Early stopping at epoch {epoch + 1}")
+                        break
 
-        if epoch > EARLY_STOPPING_PATIENCE and accuracy < best_accuracy:
-             break
+                cv_scores.append(best_accuracy)
+                del model, optimizer, scheduler, scaler, train_dl, valid_dl, class_weights
+                torch.cuda.empty_cache()
+                
+            finally:
+                if os.path.exists(train_fold_csv):
+                    os.remove(train_fold_csv)
+                if os.path.exists(valid_fold_csv):
+                    os.remove(valid_fold_csv)
 
-    del model, optimizer, scheduler, scaler, train_dl, valid_dl, class_weights
-    torch.cuda.empty_cache()
+        mean_cv_score = np.mean(cv_scores)
+        std_cv_score = np.std(cv_scores)
+        logger.info(f"  CV Score: {mean_cv_score:.4f} ± {std_cv_score:.4f}")
+        return mean_cv_score
 
-    return best_accuracy
+    else:
+        train_dl, valid_dl, _, class_weights = prepare_dataloaders(
+            train_csv, valid_csv, MODEL_NAME, BATCH_SIZE, MAX_LENGTH, 
+            augment_prob=AUGMENT_PROB
+        )
+
+        class_weights = class_weights.to(DEVICE)
+        loss_fn = CrossEntropyLoss(weight=class_weights)
+
+        model = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_CLASSES).to(DEVICE)
+        model.gradient_checkpointing_enable()
+        
+        if hasattr(model.config, 'hidden_dropout_prob'):
+            model.config.hidden_dropout_prob = DROPOUT_RATE
+            model.config.attention_probs_dropout_prob = DROPOUT_RATE
+
+        optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        total_steps = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
+        warmup_steps = int(total_steps * WARMUP_RATIO)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+        scaler = GradScaler()
+
+        torch.cuda.empty_cache()
+
+        best_accuracy = 0
+        no_improve_count = 0
+        
+        for epoch in range(EPOCHS):
+            train_epoch(model, train_dl, loss_fn, optimizer, scheduler, scaler, ACCUMULATION_STEPS)
+            true_labels, predictions, _, _ = eval_model(model, valid_dl, loss_fn)
+            accuracy = accuracy_score(true_labels, predictions)
+
+            trial.report(accuracy, epoch)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if no_improve_count >= EARLY_STOPPING_PATIENCE:
+                logger.info(f"Early stopping at epoch {epoch + 1}")
+                break
+
+        del model, optimizer, scheduler, scaler, train_dl, valid_dl, class_weights
+        torch.cuda.empty_cache()
+
+        return best_accuracy
 
 
 def plot_visualizations(true_labels, predictions, output_dir):
@@ -236,9 +339,17 @@ if __name__ == '__main__':
     best_params = best_trial.params
     LEARNING_RATE = best_params['lr']
     BATCH_SIZE = best_params['batch_size']
+    ACCUMULATION_STEPS = best_params['accumulation_steps']
+    WEIGHT_DECAY = best_params.get('weight_decay', 0.01)
+    WARMUP_RATIO = best_params.get('warmup_ratio', 0.1)
+    DROPOUT_RATE = best_params.get('dropout_rate', 0.1)
+    AUGMENT_PROB = best_params.get('augment_prob', 0.3)
+    
+    logger.info(f"Final training with: LR={LEARNING_RATE:.2e}, BS={BATCH_SIZE}, "
+                f"WD={WEIGHT_DECAY:.3f}, Warmup={WARMUP_RATIO:.3f}, Dropout={DROPOUT_RATE:.3f}")
 
     train_dl, valid_dl, test_dl, class_weights = prepare_dataloaders(
-        train_csv, valid_csv, MODEL_NAME, BATCH_SIZE, MAX_LENGTH
+        train_csv, valid_csv, MODEL_NAME, BATCH_SIZE, MAX_LENGTH, augment_prob=AUGMENT_PROB
     )
 
     class_weights = class_weights.to(DEVICE)
@@ -246,10 +357,14 @@ if __name__ == '__main__':
 
     model = BertForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_CLASSES).to(DEVICE)
     model.gradient_checkpointing_enable()
+    
+    if hasattr(model.config, 'hidden_dropout_prob'):
+        model.config.hidden_dropout_prob = DROPOUT_RATE
+        model.config.attention_probs_dropout_prob = DROPOUT_RATE
 
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     total_steps = (len(train_dl) // ACCUMULATION_STEPS) * EPOCHS
-    warmup_steps = int(total_steps * 0.1)
+    warmup_steps = int(total_steps * WARMUP_RATIO)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
     scaler = GradScaler()
 
@@ -257,6 +372,13 @@ if __name__ == '__main__':
 
     best_accuracy = 0
     epochs_no_improve = 0
+    training_history = {
+        'epochs': [],
+        'train_loss': [],
+        'valid_loss': [],
+        'valid_accuracy': [],
+        'learning_rate': []
+    }
 
     start_time = time.time()
     for epoch in range(EPOCHS):
@@ -266,8 +388,17 @@ if __name__ == '__main__':
 
         true_labels, predictions, _, avg_val_loss = eval_model(model, valid_dl, loss_fn)
         accuracy = accuracy_score(true_labels, predictions)
+        current_lr = optimizer.param_groups[0]['lr']
         elapsed_time = time.time() - start_time
-        print(f'Validation Accuracy: {accuracy:.4f}, Validation Loss: {avg_val_loss:.4f} | Time: {elapsed_time // 60:.0f}m {elapsed_time % 60:.0f}s')
+        
+        training_history['epochs'].append(epoch + 1)
+        training_history['train_loss'].append(avg_train_loss)
+        training_history['valid_loss'].append(avg_val_loss)
+        training_history['valid_accuracy'].append(accuracy)
+        training_history['learning_rate'].append(current_lr)
+        
+        print(f'Validation Accuracy: {accuracy:.4f}, Validation Loss: {avg_val_loss:.4f}, '
+              f'LR: {current_lr:.2e} | Time: {elapsed_time // 60:.0f}m {elapsed_time % 60:.0f}s')
 
         if accuracy > best_accuracy:
             best_accuracy = accuracy
@@ -275,6 +406,10 @@ if __name__ == '__main__':
             test_dl.dataset.tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, 'fine_tuned_model'))
             epochs_no_improve = 0
             print("New best model saved.")
+            
+            with open(os.path.join(OUTPUT_DIR, 'best_hyperparameters.json'), 'w') as f:
+                json.dump(best_params, f, indent=2)
+                
         else:
             epochs_no_improve += 1
 
@@ -282,9 +417,13 @@ if __name__ == '__main__':
             print(f"Early stopping triggered after {epoch + 1} epochs.")
             break
 
+    with open(os.path.join(OUTPUT_DIR, 'training_history.json'), 'w') as f:
+        json.dump(training_history, f, indent=2)
+
     end_time = time.time()
     elapsed_time = end_time - start_time
     print(f"Total training time: {elapsed_time // 60:.0f}m {elapsed_time % 60:.0f}s")
+    logger.info(f"Best validation accuracy achieved: {best_accuracy:.4f}")
 
     print("\nLoading best model for final evaluation on test set...")
     model = BertForSequenceClassification.from_pretrained(os.path.join(OUTPUT_DIR, 'fine_tuned_model')).to(DEVICE)
