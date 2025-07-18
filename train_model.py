@@ -134,22 +134,25 @@ def cross_validate_trial(params, train_csv, valid_csv, trial):
         train_fold_csv = f'temp_train_fold_{fold}.csv'
         valid_fold_csv = f'temp_valid_fold_{fold}.csv'
         
-        try:
-            train_fold_df.to_csv(train_fold_csv, index=False)
-            valid_fold_df.to_csv(valid_fold_csv, index=False)
-            
-            train_dl, valid_dl, _, class_weights = prepare_dataloaders(
-                train_fold_csv, valid_fold_csv, MODEL_NAME, 
-                params['batch_size'], MAX_LENGTH, augment_prob=params['augment_prob']
-            )
-            
-            fold_score = train_fold(
-                train_dl, valid_dl, class_weights, params, trial, fold
-            )
-            cv_scores.append(fold_score)
-            
-            del train_dl, valid_dl, class_weights
-            torch.cuda.empty_cache()
+        train_fold_df.to_csv(train_fold_csv, index=False)
+        valid_fold_df.to_csv(valid_fold_csv, index=False)
+        
+        train_dl, valid_dl, _, class_weights = prepare_dataloaders(
+            train_fold_csv, valid_fold_csv, MODEL_NAME, 
+            params['batch_size'], MAX_LENGTH, augment_prob=params['augment_prob']
+        )
+        
+        fold_score = train_fold(
+            train_dl, valid_dl, class_weights, params, trial, fold
+        )
+        cv_scores.append(fold_score)
+        
+        del train_dl, valid_dl, class_weights
+        torch.cuda.empty_cache()
+        
+        for temp_file in [train_fold_csv, valid_fold_csv]:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
     
     mean_score = np.mean(cv_scores)
     std_score = np.std(cv_scores)

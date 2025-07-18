@@ -2,6 +2,10 @@ import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
+import warnings
+warnings.filterwarnings("ignore", message="expandable_segments not supported on this platform")
+import torch
+
 import torch
 import numpy as np
 import pandas as pd
