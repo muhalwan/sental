@@ -113,7 +113,8 @@ def train_epoch(
         scheduler: torch.optim.lr_scheduler._LRScheduler,
         scaler: GradScaler,
         accumulation_steps: int,
-        clip_grad_norm: float = 1.0  # Added gradient clipping
+        clip_grad_norm: float = 1.0,
+        epoch: Optional[int] = None
 ) -> float:
     """
     Train the model for one epoch with gradient accumulation and mixed precision.
@@ -127,6 +128,7 @@ def train_epoch(
         scaler: Gradient scaler for mixed precision training
         accumulation_steps: Number of steps to accumulate gradients
         clip_grad_norm: Maximum gradient norm for clipping
+        epoch: Current epoch number (0-based) for progress display
 
     Returns:
         float: Average training loss per batch
@@ -136,7 +138,8 @@ def train_epoch(
     num_batches = 0
     optimizer.zero_grad()
 
-    progress_bar = tqdm(data_loader, desc="Training", leave=False)
+    desc = "Training" if epoch is None else f"Training Epoch {epoch + 1}/{EPOCHS}"
+    progress_bar = tqdm(data_loader, desc=desc, leave=False)
     for i, batch in enumerate(progress_bar):
         try:
             input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
@@ -182,7 +185,8 @@ def train_epoch(
 def eval_model(
         model: torch.nn.Module,
         data_loader: torch.utils.data.DataLoader,
-        loss_fn: torch.nn.Module
+        loss_fn: torch.nn.Module,
+        epoch: Optional[int] = None
 ) -> Tuple[List[int], List[int], np.ndarray, float]:
     """
     Evaluate the model on validation/test data.
@@ -191,6 +195,7 @@ def eval_model(
         model: The model to evaluate
         data_loader: Validation/test data loader
         loss_fn: Loss function
+        epoch: Current epoch number (0-based) for progress display
 
     Returns:
         tuple: (true_labels, predictions, probabilities, avg_loss)
@@ -200,8 +205,9 @@ def eval_model(
     predictions, true_labels, all_probs = [], [], []
     num_batches = 0
 
+    desc = "Evaluating" if epoch is None else f"Evaluating Epoch {epoch + 1}/{EPOCHS}"
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Evaluating", leave=False):
+        for batch in tqdm(data_loader, desc=desc, leave=False):
             try:
                 input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
                 attention_mask = batch['attention_mask'].to(DEVICE, non_blocking=True)
@@ -354,10 +360,11 @@ def train_fold(
         for epoch in range(EPOCHS):
             train_loss = train_epoch(
                 model, train_dl, loss_fn, optimizer, scheduler, scaler,
-                hp_config['accumulation_steps'], hp_config['clip_grad_norm']
+                hp_config['accumulation_steps'], hp_config['clip_grad_norm'],
+                epoch=epoch
             )
 
-            true_labels, predictions, _, val_loss = eval_model(model, valid_dl, loss_fn)
+            true_labels, predictions, _, val_loss = eval_model(model, valid_dl, loss_fn, epoch=epoch)
             accuracy = accuracy_score(true_labels, predictions)
 
             trial.report(accuracy, epoch)
@@ -726,10 +733,11 @@ def main():
 
         avg_train_loss = train_epoch(
             model, train_dl, loss_fn, optimizer, scheduler, scaler,
-            accumulation_steps, best_params.get('clip_grad_norm', 1.0)
+            accumulation_steps, best_params.get('clip_grad_norm', 1.0),
+            epoch=epoch
         )
 
-        true_labels, predictions, probs, avg_val_loss = eval_model(model, valid_dl, loss_fn)
+        true_labels, predictions, probs, avg_val_loss = eval_model(model, valid_dl, loss_fn, epoch=epoch)
         accuracy = accuracy_score(true_labels, predictions)
         current_lr = optimizer.param_groups[0]['lr']
 
