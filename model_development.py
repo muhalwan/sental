@@ -5,7 +5,8 @@ import time
 import json
 import logging
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict, Any
+from typing import Tuple, List, Optional, Dict, Any, cast
+
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -19,7 +20,6 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
 from transformers import BertForSequenceClassification, get_linear_schedule_with_warmup, AutoTokenizer
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc
@@ -69,15 +69,6 @@ else:
 
 
 class FocalLoss(torch.nn.Module):
-    """
-    Focal Loss for handling class imbalance.
-
-    Args:
-        alpha (torch.Tensor): Class weights
-        gamma (float): Focusing parameter
-        reduction (str): Reduction method ('mean', 'sum', 'none')
-    """
-
     def __init__(self, alpha: Optional[torch.Tensor] = None,
                  gamma: float = 2.0,
                  reduction: str = 'mean'):
@@ -110,29 +101,12 @@ def train_epoch(
         data_loader: torch.utils.data.DataLoader,
         loss_fn: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler._LRScheduler,
+        scheduler: Any,
         scaler: GradScaler,
         accumulation_steps: int,
         clip_grad_norm: float = 1.0,
         epoch: Optional[int] = None
 ) -> float:
-    """
-    Train the model for one epoch with gradient accumulation and mixed precision.
-
-    Args:
-        model: The model to train
-        data_loader: Training data loader
-        loss_fn: Loss function
-        optimizer: Optimizer for updating model parameters
-        scheduler: Learning rate scheduler
-        scaler: Gradient scaler for mixed precision training
-        accumulation_steps: Number of steps to accumulate gradients
-        clip_grad_norm: Maximum gradient norm for clipping
-        epoch: Current epoch number (0-based) for progress display
-
-    Returns:
-        float: Average training loss per batch
-    """
     model.train()
     total_loss = 0
     num_batches = 0
@@ -141,6 +115,7 @@ def train_epoch(
     desc = "Training" if epoch is None else f"Training Epoch {epoch + 1}/{EPOCHS}"
     progress_bar = tqdm(data_loader, desc=desc, leave=False)
     for i, batch in enumerate(progress_bar):
+        batch = cast(Dict[str, torch.Tensor], batch)
         try:
             input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
             attention_mask = batch['attention_mask'].to(DEVICE, non_blocking=True)
@@ -188,18 +163,6 @@ def eval_model(
         loss_fn: torch.nn.Module,
         epoch: Optional[int] = None
 ) -> Tuple[List[int], List[int], np.ndarray, float]:
-    """
-    Evaluate the model on validation/test data.
-
-    Args:
-        model: The model to evaluate
-        data_loader: Validation/test data loader
-        loss_fn: Loss function
-        epoch: Current epoch number (0-based) for progress display
-
-    Returns:
-        tuple: (true_labels, predictions, probabilities, avg_loss)
-    """
     model.eval()
     total_loss = 0
     predictions, true_labels, all_probs = [], [], []
@@ -208,6 +171,7 @@ def eval_model(
     desc = "Evaluating" if epoch is None else f"Evaluating Epoch {epoch + 1}/{EPOCHS}"
     with torch.no_grad():
         for batch in tqdm(data_loader, desc=desc, leave=False):
+            batch = cast(Dict[str, torch.Tensor], batch)
             try:
                 input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
                 attention_mask = batch['attention_mask'].to(DEVICE, non_blocking=True)
@@ -289,7 +253,7 @@ def objective(trial: optuna.Trial, train_csv: str, valid_csv: str) -> float:
                 valid_fold_csv.unlink(missing_ok=True)
                 clear_gpu_memory()
 
-        mean_cv_score = np.mean(cv_scores)
+        mean_cv_score = float(np.mean(cv_scores))
         std_cv_score = np.std(cv_scores)
         logger.info(f"  CV Score: {mean_cv_score:.4f} ± {std_cv_score:.4f}")
         return mean_cv_score
@@ -385,7 +349,7 @@ def train_fold(
 
     except Exception as e:
         logger.error(f"Error in fold {fold}: {str(e)}")
-        return 0.0
+        raise
 
     finally:
         # Cleanup
@@ -625,11 +589,11 @@ def main():
     storage = f"sqlite:///{OUTPUT_DIR / 'optuna_study.db'}"
     study_name = "financial_sentiment_optimization"
 
+    from optuna.trial import TrialState
+
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
-        logger.info(f"Resuming existing study '{study_name}' with {len(study.trials)} trials already completed.")
     except KeyError:
-        logger.info(f"Creating new study '{study_name}'.")
         study = optuna.create_study(
             study_name=study_name,
             storage=storage,
@@ -639,16 +603,41 @@ def main():
             load_if_exists=True
         )
 
-    remaining_trials = N_TRIALS - len(study.trials)
+    running_trials = study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
+    for trial in running_trials:
+        logger.info(f"Failing incomplete running trial {trial.number}")
+        study.tell(trial.number, state=TrialState.FAIL)
+
+    completed_trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+    pruned_trials = study.get_trials(deepcopy=False, states=(TrialState.PRUNED,))
+    failed_trials = study.get_trials(deepcopy=False, states=(TrialState.FAIL,))
+    running_trials = study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
+
+    logger.info(
+        f"Study status: "
+        f"{len(completed_trials)} completed, {len(pruned_trials)} pruned, "
+        f"{len(failed_trials)} failed, {len(running_trials)} running."
+    )
+
+    completed_count = len(completed_trials)
+    remaining_trials = max(N_TRIALS - completed_count, 0)
+    last_number = max([t.number for t in study.trials], default=-1)
+
     if remaining_trials > 0:
+        logger.info(
+            f"{completed_count} trials completed out of target {N_TRIALS}. "
+            f"Scheduling {remaining_trials} more. Next trial number will start at {last_number + 1}."
+        )
         study.optimize(
-            lambda trial: objective(trial, str(train_csv), str(valid_csv)),
+            lambda t: objective(t, str(train_csv), str(valid_csv)),
             n_trials=remaining_trials,
             timeout=3600 * 6,
             gc_after_trial=True
         )
     else:
-        logger.info(f"All {N_TRIALS} trials already completed. Skipping optimization.")
+        logger.info(
+            f"{completed_count} trials completed. Target {N_TRIALS} already reached. Skipping optimization."
+        )
 
     logger.info("=" * 50)
     logger.info("Optimization finished.")
@@ -688,100 +677,64 @@ def main():
         r=best_params.get('lora_r', 8),
         lora_alpha=32,
         lora_dropout=best_params.get('dropout_rate', 0.1),
-        bias="none",
-        target_modules=["query", "value"]
     )
     model = get_peft_model(model, lora_config)
-    model = model.to(DEVICE)
+    model.to(DEVICE)
 
-    if hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
-
-    optimizer = AdamW(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=best_params['lr'],
         weight_decay=best_params.get('weight_decay', 0.01),
         eps=best_params.get('eps', 1e-8)
     )
 
-    accumulation_steps = best_params.get('accumulation_steps', ACCUMULATION_STEPS)
-    total_steps = (len(train_dl) // accumulation_steps) * EPOCHS
-    warmup_steps = int(total_steps * best_params.get('warmup_ratio', 0.1))
-
+    total_steps = len(train_dl) * EPOCHS // best_params.get('accumulation_steps', 1)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=warmup_steps,
+        num_warmup_steps=int(total_steps * best_params.get('warmup_ratio', 0.1)),
         num_training_steps=total_steps
     )
 
-    scaler = GradScaler(init_scale=2.**16)
-
-    best_accuracy = 0
+    best_val_acc = -1.0
     epochs_no_improve = 0
-    training_history = {
-        'epochs': [],
-        'train_loss': [],
-        'valid_loss': [],
-        'valid_accuracy': [],
-        'learning_rate': []
-    }
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-    start_time = time.time()
-
-    for epoch in range(EPOCHS):
-        logger.info(f'\nEpoch {epoch + 1}/{EPOCHS}')
-
-        avg_train_loss = train_epoch(
+    for epoch in range(1, EPOCHS + 1):
+        start_time = time.time()
+        train_loss = train_epoch(
             model, train_dl, loss_fn, optimizer, scheduler, scaler,
-            accumulation_steps, best_params.get('clip_grad_norm', 1.0),
-            epoch=epoch
+            accumulation_steps=best_params.get('accumulation_steps', 1),
+            clip_grad_norm=best_params.get('clip_grad_norm', 1.0),
+            epoch=epoch-1
         )
+        true_labels, predictions, _, val_loss = eval_model(model, valid_dl, loss_fn, epoch=epoch-1)
+        val_acc = accuracy_score(true_labels, predictions)
 
-        true_labels, predictions, probs, avg_val_loss = eval_model(model, valid_dl, loss_fn, epoch=epoch)
-        accuracy = accuracy_score(true_labels, predictions)
-        current_lr = optimizer.param_groups[0]['lr']
-
-        training_history['epochs'].append(epoch + 1)
-        training_history['train_loss'].append(avg_train_loss)
-        training_history['valid_loss'].append(avg_val_loss)
-        training_history['valid_accuracy'].append(accuracy)
-        training_history['learning_rate'].append(current_lr)
-
-        elapsed_time = time.time() - start_time
+        elapsed = time.time() - start_time
         logger.info(
-            f'Train Loss: {avg_train_loss:.4f} | '
-            f'Val Loss: {avg_val_loss:.4f} | '
-            f'Val Acc: {accuracy:.4f} | '
-            f'LR: {current_lr:.2e} | '
-            f'Time: {elapsed_time // 60:.0f}m {elapsed_time % 60:.0f}s'
+            f"\nEpoch {epoch}/{EPOCHS}\n"
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"Val Acc: {val_acc:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | "
+            f"Time: {int(elapsed//60)}m {int(elapsed%60)}s"
         )
 
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-            save_model_artifacts(model, tokenizer, best_params, training_history, OUTPUT_DIR)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             epochs_no_improve = 0
+            save_model_artifacts(
+                model=model,
+                tokenizer=AutoTokenizer.from_pretrained(MODEL_NAME),
+                best_params=best_params,
+                training_history={},
+                output_dir=OUTPUT_DIR
+            )
             logger.info("New best model saved.")
         else:
             epochs_no_improve += 1
 
-        if epochs_no_improve == EARLY_STOPPING_PATIENCE:
-            logger.info(f"Early stopping triggered after {epoch + 1} epochs.")
+        if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
+            logger.info(f"Early stopping at epoch {epoch}")
             break
-
-    with open(OUTPUT_DIR / 'training_history.json', 'w') as f:
-        json.dump(training_history, f, indent=2)
-
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    logger.info(f"Total training time: {elapsed_time // 60:.0f}m {elapsed_time % 60:.0f}s")
-    logger.info(f"Best validation accuracy achieved: {best_accuracy:.4f}")
-
-    logger.info("=" * 50)
-    logger.info("Loading best model for final evaluation on test set...")
-    logger.info("=" * 50)
-
-    model = BertForSequenceClassification.from_pretrained(OUTPUT_DIR / 'fine_tuned_model').to(DEVICE)
 
     export_to_onnx(model, OUTPUT_DIR)
 
