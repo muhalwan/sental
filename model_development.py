@@ -25,7 +25,6 @@ from transformers import BertForSequenceClassification, get_linear_schedule_with
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 from sklearn.model_selection import StratifiedKFold
-from wordcloud import WordCloud
 from data_preprocessing import prepare_dataloaders
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
@@ -440,43 +439,6 @@ def plot_roc_curves(
     plt.close()
 
 
-def generate_wordclouds(
-        texts: List[str],
-        labels: List[int],
-        output_dir: Path
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    df = pd.DataFrame({'text': texts, 'label': labels})
-
-    for sentiment, name in zip([0, 1, 2], ['Bearish', 'Bullish', 'Neutral']):
-        subset_text = ' '.join(df[df['label'] == sentiment]['text'].values)
-
-        if not subset_text.strip():
-            logger.warning(f"No text found for {name} sentiment")
-            continue
-
-        try:
-            wordcloud = WordCloud(
-                width=800,
-                height=400,
-                background_color='white',
-                max_words=100,
-                relative_scaling=0.5
-            ).generate(subset_text)
-
-            plt.figure(figsize=(10, 5))
-            plt.imshow(wordcloud, interpolation='bilinear')
-            plt.axis('off')
-            plt.title(f'Word Cloud for {name} Sentiment')
-            plt.tight_layout()
-            plt.savefig(output_dir / f'wordcloud_{name.lower()}.png', dpi=100)
-            plt.close()
-
-        except Exception as e:
-            logger.error(f"Error generating wordcloud for {name}: {str(e)}")
-
-
 def visualize_attention(
         model: torch.nn.Module,
         tokenizer: Any,
@@ -572,7 +534,7 @@ def export_to_onnx(
         logger.error(f"Failed to export ONNX model: {str(e)}")
 
 
-def main():
+def setup_paths():
     base_dir = Path(__file__).parent
     train_csv = base_dir / 'dataset' / 'sent_train.csv'
     valid_csv = base_dir / 'dataset' / 'sent_valid.csv'
@@ -582,14 +544,18 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    return train_csv, valid_csv
+
+
+def optimize_hyperparameters(train_csv: str, valid_csv: str):
+    from optuna.trial import TrialState
+
     logger.info("=" * 50)
     logger.info("Starting hyperparameter optimization with Optuna...")
     logger.info("=" * 50)
 
     storage = f"sqlite:///{OUTPUT_DIR / 'optuna_study.db'}"
     study_name = "financial_sentiment_optimization"
-
-    from optuna.trial import TrialState
 
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
@@ -629,7 +595,7 @@ def main():
             f"Scheduling {remaining_trials} more. Next trial number will start at {last_number + 1}."
         )
         study.optimize(
-            lambda t: objective(t, str(train_csv), str(valid_csv)),
+            lambda t: objective(t, train_csv, valid_csv),
             n_trials=remaining_trials,
             timeout=3600 * 6,
             gc_after_trial=True
@@ -650,6 +616,10 @@ def main():
     study_df = study.trials_dataframe()
     study_df.to_csv(OUTPUT_DIR / 'optuna_study_results.csv', index=False)
 
+    return study
+
+
+def train_final_model(study, train_csv: str, valid_csv: str):
     logger.info("=" * 50)
     logger.info("Starting final training with best hyperparameters...")
     logger.info("=" * 50)
@@ -657,7 +627,7 @@ def main():
     best_params = study.best_trial.params
 
     train_dl, valid_dl, test_dl, class_weights = prepare_dataloaders(
-        str(train_csv), str(valid_csv), MODEL_NAME,
+        train_csv, valid_csv, MODEL_NAME,
         best_params['batch_size'], MAX_LENGTH,
         augment_prob=best_params.get('augment_prob', 0.3)
     )
@@ -699,6 +669,8 @@ def main():
     epochs_no_improve = 0
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
     for epoch in range(1, EPOCHS + 1):
         start_time = time.time()
         train_loss = train_epoch(
@@ -723,7 +695,7 @@ def main():
             epochs_no_improve = 0
             save_model_artifacts(
                 model=model,
-                tokenizer=AutoTokenizer.from_pretrained(MODEL_NAME),
+                tokenizer=tokenizer,
                 best_params=best_params,
                 training_history={},
                 output_dir=OUTPUT_DIR
@@ -738,13 +710,14 @@ def main():
 
     export_to_onnx(model, OUTPUT_DIR)
 
+    return model, test_dl, loss_fn, tokenizer
+
+
+def perform_evaluation_and_visualizations(model, test_dl, loss_fn, tokenizer, output_dir: Path):
     true_labels, predictions, probs, _ = eval_model(model, test_dl, loss_fn)
 
-    plot_visualizations(true_labels, predictions, OUTPUT_DIR)
-    plot_roc_curves(true_labels, probs, OUTPUT_DIR)
-
-    test_texts = test_dl.dataset.texts if isinstance(test_dl.dataset.texts, list) else list(test_dl.dataset.texts)
-    generate_wordclouds(test_texts, predictions, OUTPUT_DIR)
+    plot_visualizations(true_labels, predictions, output_dir)
+    plot_roc_curves(true_labels, probs, output_dir)
 
     logger.info("\nGenerating attention visualizations for sample texts...")
     sample_texts = [
@@ -752,10 +725,19 @@ def main():
         "$CX - Cemex cut at Credit Suisse, J.P. Morgan on weak building outlook",
         "Adobe price target raised to $350 vs. $320 at Canaccord"
     ]
-    tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR / 'fine_tuned_model')
-    visualize_attention(model, tokenizer, sample_texts, OUTPUT_DIR)
+    visualize_attention(model, tokenizer, sample_texts, output_dir)
 
-    logger.info(f"\nModel and visualizations saved in '{OUTPUT_DIR}' directory.")
+    logger.info(f"\nModel and visualizations saved in '{output_dir}' directory.")
+
+
+def main():
+    train_csv, valid_csv = setup_paths()
+
+    study = optimize_hyperparameters(str(train_csv), str(valid_csv))
+
+    model, test_dl, loss_fn, tokenizer = train_final_model(study, str(train_csv), str(valid_csv))
+
+    perform_evaluation_and_visualizations(model, test_dl, loss_fn, tokenizer, OUTPUT_DIR)
 
 
 if __name__ == '__main__':

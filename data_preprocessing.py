@@ -6,13 +6,11 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer
 from sklearn.utils.class_weight import compute_class_weight
-import nltk
 import emoji
 import random
-from typing import List, Optional
 
 from nltk.corpus import stopwords
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split
 
 TICKER_MAP = {}
 stop_words = set(stopwords.words('english'))
@@ -46,7 +44,8 @@ class TextAugmentation:
         
         return ' '.join(new_words)
     
-    def random_deletion(self, text: str, p: float = 0.1) -> str:
+    @staticmethod
+    def random_deletion(text: str, p: float = 0.1) -> str:
         words = text.split()
         if len(words) == 1:
             return text
@@ -57,8 +56,9 @@ class TextAugmentation:
                 new_words.append(word)
         
         return ' '.join(new_words) if new_words else text
-    
-    def random_swap(self, text: str, n: int = 1) -> str:
+
+    @staticmethod
+    def random_swap(text: str, n: int = 1) -> str:
         words = text.split()
         if len(words) < 2:
             return text
@@ -144,8 +144,8 @@ class FinanceDataset(Dataset):
 
 
 def prepare_dataloaders(
-        train_csv,
-        valid_csv,
+        train_csv_p,
+        valid_csv_p,
         model_name='ProsusAI/finbert',
         batch_size=32,
         max_length=128,
@@ -153,8 +153,8 @@ def prepare_dataloaders(
         random_state=42,
         augment_prob=0.3
 ):
-    df_train = pd.read_csv(train_csv)
-    df_valid = pd.read_csv(valid_csv)
+    df_train = pd.read_csv(train_csv_p)
+    df_valid = pd.read_csv(valid_csv_p)
     for df, name in [(df_train, 'Train'), (df_valid, 'Valid')]:
         if 'text' not in df.columns or 'label' not in df.columns:
             raise ValueError(f"{name} CSV must contain 'text' and 'label' columns")
@@ -166,11 +166,11 @@ def prepare_dataloaders(
     df_train_main, df_test = train_test_split(df_train, test_size=test_size, stratify=df_train['label'],
                                               random_state=random_state)
 
-    X_train_clean = clean_text_series(df_train_main['text'])
+    x_train_clean = clean_text_series(df_train_main['text'])
     y_train = df_train_main['label']
-    X_valid_clean = clean_text_series(df_valid['text'])
+    x_valid_clean = clean_text_series(df_valid['text'])
     y_valid = df_valid['label']
-    X_test_clean = clean_text_series(df_test['text'])
+    x_test_clean = clean_text_series(df_test['text'])
     y_test = df_test['label']
 
     class_weights = compute_class_weight(
@@ -181,9 +181,9 @@ def prepare_dataloaders(
     class_weights = torch.tensor(class_weights, dtype=torch.float)
 
     tokenizer = BertTokenizer.from_pretrained(model_name)
-    train_ds = FinanceDataset(X_train_clean, y_train, tokenizer, max_length, augment_prob)
-    valid_ds = FinanceDataset(X_valid_clean, y_valid, tokenizer, max_length, augment_prob)
-    test_ds = FinanceDataset(X_test_clean, y_test, tokenizer, max_length, augment_prob)
+    train_ds = FinanceDataset(x_train_clean, y_train, tokenizer, max_length, augment_prob)
+    valid_ds = FinanceDataset(x_valid_clean, y_valid, tokenizer, max_length, augment_prob)
+    test_ds = FinanceDataset(x_test_clean, y_test, tokenizer, max_length, augment_prob)
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     valid_dl = DataLoader(valid_ds, batch_size=batch_size)

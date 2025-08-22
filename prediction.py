@@ -23,6 +23,7 @@ model_path = local_model_dir
 
 def load_model_with_retry(max_retries: int = 3, retry_delay: float = 2.0):
     global model_path
+    error = None
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -39,40 +40,46 @@ def load_model_with_retry(max_retries: int = 3, retry_delay: float = 2.0):
                     )
                     logger.info(f"Model downloaded successfully to {model_path}.")
                     break
-                except Exception as e:
-                    logger.warning(f"Download attempt {attempt + 1} failed: {e}")
+                except Exception as download_error:
+                    logger.warning(f"Download attempt {attempt + 1} failed: {download_error}")
                     if attempt < max_retries - 1:
                         logger.info(f"Retrying in {retry_delay} seconds...")
                         time.sleep(retry_delay)
                     else:
-                        raise RuntimeError(f"Failed to download model after {max_retries} attempts: {e}")
+                        error = download_error
+            if error:
+                raise RuntimeError(f"Failed to download model after {max_retries} attempts: {error}") from error
         else:
             raise ValueError("Model not found locally and MODEL_URL environment variable is not set.")
 
     for attempt in range(max_retries):
         try:
             logger.info(f"Loading tokenizer from {model_path}...")
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            loaded_tokenizer = AutoTokenizer.from_pretrained(model_path)
 
             logger.info(f"Loading model from {model_path}...")
             torch_dtype = torch.float16 if device.type == 'cuda' else torch.float32
-            model = AutoPeftModelForSequenceClassification.from_pretrained(
+            loaded_model = AutoPeftModelForSequenceClassification.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
                 device_map='auto'
             )
-            model = model.merge_and_unload()
+            loaded_model = loaded_model.merge_and_unload()
 
             logger.info("Model and tokenizer loaded successfully.")
-            return tokenizer, model
+            return loaded_tokenizer, loaded_model
 
-        except Exception as e:
-            logger.warning(f"Model loading attempt {attempt + 1} failed: {e}")
+        except Exception as load_error:
+            logger.warning(f"Model loading attempt {attempt + 1} failed: {load_error}")
             if attempt < max_retries - 1:
                 logger.info(f"Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
             else:
-                raise RuntimeError(f"Failed to load model after {max_retries} attempts: {e}")
+                error = load_error
+    
+    if error:
+        raise RuntimeError(f"Failed to load model after {max_retries} attempts: {error}") from error
+    return None
 
 
 try:
@@ -83,9 +90,6 @@ except Exception as e:
 
 
 def predict_sentiment(text: str, max_length: int = 512):
-    if not isinstance(text, str):
-        raise ValueError("Input text must be a string")
-
     if not text or len(text.strip()) == 0:
         raise ValueError("Input text cannot be empty")
 
@@ -104,18 +108,18 @@ def predict_sentiment(text: str, max_length: int = 512):
         with torch.inference_mode():
             outputs = model(**inputs)
 
-        probabilities = F.softmax(outputs.logits, dim=-1).squeeze()
-        predicted_class_idx = torch.argmax(probabilities).item()
+        s_probabilities = F.softmax(outputs.logits, dim=-1).squeeze()
+        predicted_class_idx = torch.argmax(s_probabilities).item()
 
         labels = ['Bearish', 'Bullish', 'Neutral']
-        prediction = labels[predicted_class_idx]
+        s_prediction = labels[predicted_class_idx]
 
-        probs_dict = {label: prob.item() for label, prob in zip(labels, probabilities)}
+        probs_dict = {label: s_prob.item() for label, s_prob in zip(labels, s_probabilities)}
 
-        return prediction, probs_dict
+        return s_prediction, probs_dict
 
-    except Exception as e:
-        raise RuntimeError(f"Failed to predict sentiment: {str(e)}")
+    except Exception as err:
+        raise RuntimeError(f"Failed to predict sentiment: {str(err)}")
 
 
 if __name__ == '__main__':
