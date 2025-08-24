@@ -5,12 +5,13 @@ import time
 import json
 import logging
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict, Any, cast
-
+from typing import Tuple, List, Optional, Dict, Any
+import math
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 warnings.filterwarnings("ignore", message="expandable_segments not supported on this platform")
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -20,17 +21,30 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 from torch.optim import AdamW
-from transformers import BertForSequenceClassification, get_linear_schedule_with_warmup, AutoTokenizer
+from transformers import AutoModelForSequenceClassification, get_linear_schedule_with_warmup, AutoTokenizer
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 from sklearn.model_selection import StratifiedKFold
 from data_preprocessing import prepare_dataloaders
-from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import torch.nn.functional as F
 import optuna
 from peft import LoraConfig, get_peft_model, TaskType
+from accelerate import Accelerator
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.naive_bayes import MultinomialNB
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+import ml_collections
+from contextlib import nullcontext
+import hashlib
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,12 +55,12 @@ logger = logging.getLogger(__name__)
 MODEL_NAME = 'yiyanghkust/finbert-tone'
 NUM_CLASSES = 3
 EPOCHS = 15
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 ACCUMULATION_STEPS = 4
 MAX_LENGTH = 128
 LEARNING_RATE = 3e-5
 OUTPUT_DIR = Path('model_outputs')
-EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_PATIENCE = 3
 N_TRIALS = 20
 USE_CROSS_VALIDATION = True
 N_FOLDS = 5
@@ -58,13 +72,62 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
 
-if torch.cuda.is_available():
-    DEVICE = torch.device('cuda')
-    logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-else:
-    DEVICE = torch.device('cpu')
-    logger.warning("GPU not available, using CPU. Training will be slower.")
+
+def _space_signature():
+    space = {
+        "lr": ("float_log", 1e-6, 1e-4),
+        "batch_size": ("cat", [8, 16, 32]),
+        "accumulation_steps": ("cat", [2, 4, 8]),
+        "weight_decay": ("float", 0.0, 0.1),
+        "warmup_ratio": ("float", 0.05, 0.2),
+        "dropout_rate": ("float", 0.1, 0.5),
+        "augment_prob": ("float", 0.0, 0.5),
+        "gamma": ("float", 1.0, 3.0),
+        "eps": ("float_log", 1e-9, 1e-6),
+        "lora_r": ("cat", [4, 8, 16]),
+        "clip_grad_norm": ("float", 0.5, 2.0),
+    }
+    blob = json.dumps(space, sort_keys=True).encode()
+    return hashlib.md5(blob).hexdigest()[:8]
+
+
+def get_device():
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        if __name__ == '__main__':
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    else:
+        device = torch.device('cpu')
+        if __name__ == '__main__':
+            logger.warning("GPU not available, using CPU. Training will be slower.")
+    return device
+
+
+DEVICE = get_device()
+
+
+def move_to_device(batch, device):
+    import numpy as _np
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, _np.ndarray):
+        return torch.from_numpy(batch).to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {k: move_to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(move_to_device(v, device) for v in batch)
+    return batch
+
+
+def setup_nltk():
+    import nltk
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('tokenizers/punkt_tab')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
+        nltk.download('punkt_tab', quiet=True)
 
 
 class FocalLoss(torch.nn.Module):
@@ -72,7 +135,10 @@ class FocalLoss(torch.nn.Module):
                  gamma: float = 2.0,
                  reduction: str = 'mean'):
         super(FocalLoss, self).__init__()
-        self.alpha = alpha
+        if alpha is not None:
+            self.register_buffer('alpha', alpha)
+        else:
+            self.alpha = None
         self.gamma = gamma
         self.reduction = reduction
 
@@ -92,19 +158,101 @@ class FocalLoss(torch.nn.Module):
 def clear_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        gc.collect()
+        torch.cuda.synchronize()
+    gc.collect()
+
+
+def model_config():
+    cfg_dictionary = {
+        "data_path": "dataset/sent_train.csv",
+        "model_path": "/models/bert_model.h5",
+        "model_type": "transformer",
+        "test_size": 0.1,
+        "validation_size": 0.2,
+        "train_batch_size": 32,
+        "eval_batch_size": 32,
+        "epochs": 5,
+        "adam_epsilon": 1e-8,
+        "lr": 3e-5,
+        "num_warmup_steps": 10,
+        "max_length": 128,
+        "random_seed": 42,
+        "num_labels": 3,
+        "model_checkpoint": 'yiyanghkust/finbert-tone',
+    }
+    cfg = ml_collections.FrozenConfigDict(cfg_dictionary)
+    return cfg
+
+
+def preprocess_csv(csv_file: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_file)
+    from sklearn.preprocessing import LabelEncoder
+    labelencoder = LabelEncoder()
+    df["label_enc"] = labelencoder.fit_transform(df["Sentiment"])
+    df.rename(columns={"label": "label_desc"}, inplace=True)
+    df.rename(columns={"label_enc": "labels"}, inplace=True)
+    df.drop_duplicates(subset=['Sentence'], keep='first', inplace=True)
+    return df
+
+
+def perform_eda(df: pd.DataFrame, output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from ydata_profiling import ProfileReport
+    except ImportError:
+        from pandas_profiling import ProfileReport
+
+    profile = ProfileReport(df, title="Financial Sentiment Analysis", minimal=True)
+    profile.to_file(output_dir / "eda_report.html")
+
+
+def ml_based_approach(df: pd.DataFrame):
+    setup_nltk()
+    from nltk.tokenize import word_tokenize
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        np.array(df["Sentence"]), np.array(df["labels"]), test_size=0.25, random_state=SEED
+    )
+
+    tfidf = TfidfVectorizer(use_idf=True, tokenizer=word_tokenize, min_df=0.00002, max_df=0.70)
+    x_train_tf = tfidf.fit_transform(x_train.astype('U'))
+    x_test_tf = tfidf.transform(x_test.astype('U'))
+
+    clfs = {
+        "Random Forest": RandomForestClassifier(random_state=SEED, n_jobs=-1),
+        "Gradient Boosting": GradientBoostingClassifier(random_state=SEED),
+        "AdaBoost": AdaBoostClassifier(random_state=SEED),
+        "LightGBM": LGBMClassifier(random_state=SEED, verbose=-1),
+        "XGBoost": XGBClassifier(eval_metric="mlogloss", random_state=SEED, verbosity=0),
+        "Decision Tree": DecisionTreeClassifier(random_state=SEED),
+        "Support Vector Machine": SVC(random_state=SEED),
+        "Naive Bayes": MultinomialNB(),
+        "Multilayer Perceptron": MLPClassifier(random_state=SEED, max_iter=500)
+    }
+
+    accuracies = []
+    for name, clf in tqdm(clfs.items(), desc="Training ML Models"):
+        clf.fit(x_train_tf, y_train)
+        y_pred = clf.predict(x_test_tf)
+        accuracy = accuracy_score(y_pred, y_test)
+        accuracies.append(accuracy)
+
+    models_df = pd.DataFrame({"Models": clfs.keys(), "Accuracy Scores": accuracies}).sort_values(
+        'Accuracy Scores', ascending=False
+    )
+    return models_df
 
 
 def train_epoch(
         model: torch.nn.Module,
         data_loader: torch.utils.data.DataLoader,
-        loss_fn: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: Any,
-        scaler: GradScaler,
+        loss_fn: torch.nn.Module,
         accumulation_steps: int,
         clip_grad_norm: float = 1.0,
-        epoch: Optional[int] = None
+        epoch: Optional[int] = None,
+        accelerator: Accelerator = None
 ) -> float:
     model.train()
     total_loss = 0
@@ -113,45 +261,49 @@ def train_epoch(
 
     desc = "Training" if epoch is None else f"Training Epoch {epoch + 1}/{EPOCHS}"
     progress_bar = tqdm(data_loader, desc=desc, leave=False)
-    for i, batch in enumerate(progress_bar):
-        batch = cast(Dict[str, torch.Tensor], batch)
-        try:
-            input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
-            attention_mask = batch['attention_mask'].to(DEVICE, non_blocking=True)
-            labels = batch['labels'].to(DEVICE, non_blocking=True)
 
-            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.float16):
-                outputs = model(input_ids, attention_mask=attention_mask)
+    for i, batch in enumerate(progress_bar):
+        target_device = accelerator.device if accelerator is not None else DEVICE
+        batch = move_to_device(batch, target_device)
+
+        try:
+            ctx = accelerator.autocast() if accelerator is not None else nullcontext()
+            with ctx:
+                outputs = model(**batch)
                 logits = outputs.logits
-                loss = loss_fn(logits, labels)
-                loss = loss / accumulation_steps
+                labels = batch["labels"]
+                loss = loss_fn(logits, labels) / accumulation_steps
+
+            if accelerator is not None:
+                accelerator.backward(loss)
+            else:
+                loss.backward()
 
             total_loss += loss.item() * accumulation_steps
             num_batches += 1
 
-            scaler.scale(loss).backward()
-
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(data_loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
-
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+                if accelerator is not None:
+                    accelerator.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                optimizer.step()
                 scheduler.step()
+                optimizer.zero_grad()
 
-                current_loss = loss.item() * accumulation_steps
-                progress_bar.set_postfix({'loss': f'{current_loss:.4f}',
-                                          'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
+            progress_bar.set_postfix({
+                'loss': f'{loss.item() * accumulation_steps:.4f}',
+                'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+            })
 
-        except RuntimeError as e:
-            if "out of memory" in str(e):
+        except RuntimeError as exc:
+            if "out of memory" in str(exc):
                 logger.warning("OOM detected, clearing cache and skipping batch")
                 clear_gpu_memory()
                 optimizer.zero_grad()
                 continue
             else:
-                raise e
+                raise exc
 
     return total_loss / max(num_batches, 1)
 
@@ -160,53 +312,55 @@ def eval_model(
         model: torch.nn.Module,
         data_loader: torch.utils.data.DataLoader,
         loss_fn: torch.nn.Module,
-        epoch: Optional[int] = None
+        epoch: Optional[int] = None,
+        accelerator: Accelerator = None
 ) -> Tuple[List[int], List[int], np.ndarray, float]:
     model.eval()
-    total_loss = 0
-    predictions, true_labels, all_probs = [], [], []
+    total_loss = 0.0
     num_batches = 0
+    predictions: List[int] = []
+    true_labels: List[int] = []
+    all_probs_list: List[List[float]] = []
 
     desc = "Evaluating" if epoch is None else f"Evaluating Epoch {epoch + 1}/{EPOCHS}"
+
     with torch.no_grad():
         for batch in tqdm(data_loader, desc=desc, leave=False):
-            batch = cast(Dict[str, torch.Tensor], batch)
-            try:
-                input_ids = batch['input_ids'].to(DEVICE, non_blocking=True)
-                attention_mask = batch['attention_mask'].to(DEVICE, non_blocking=True)
-                labels = batch['labels'].to(DEVICE, non_blocking=True)
+            target_device = accelerator.device if accelerator is not None else DEVICE
+            batch = move_to_device(batch, target_device)
 
-                with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.float16):
-                    outputs = model(input_ids, attention_mask=attention_mask)
-                    logits = outputs.logits
-                    loss = loss_fn(logits, labels)
+            ctx = accelerator.autocast() if accelerator is not None else nullcontext()
+            with ctx:
+                outputs = model(**batch)
+                logits = outputs.logits
+                labels = batch["labels"]
+                loss = loss_fn(logits, labels)
 
-                total_loss += loss.item()
-                num_batches += 1
+            total_loss += loss.item()
+            num_batches += 1
 
-                probs = F.softmax(logits, dim=1).cpu().numpy()
-                preds = np.argmax(probs, axis=1)
+            probs_t = F.softmax(logits, dim=1)
+            preds_t = torch.argmax(probs_t, dim=1)
 
-                predictions.extend(preds.tolist())
-                true_labels.extend(labels.cpu().numpy().tolist())
-                all_probs.extend(probs.tolist())
+            if accelerator is not None:
+                preds_g = accelerator.gather_for_metrics(preds_t)
+                labels_g = accelerator.gather_for_metrics(labels)
+                probs_g = accelerator.gather_for_metrics(probs_t)
+            else:
+                preds_g, labels_g, probs_g = preds_t, labels, probs_t
 
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    logger.warning("OOM during evaluation, clearing cache")
-                    clear_gpu_memory()
-                    continue
-                else:
-                    raise e
+            predictions.extend(preds_g.detach().cpu().tolist())
+            true_labels.extend(labels_g.detach().cpu().tolist())
+            all_probs_list.extend(probs_g.detach().cpu().tolist())
 
     avg_loss = total_loss / max(num_batches, 1)
-    return true_labels, predictions, np.array(all_probs), avg_loss
+    return true_labels, predictions, np.asarray(all_probs_list), avg_loss
 
 
 def objective(trial: optuna.Trial, train_csv: str, valid_csv: str) -> float:
     hp_config = {
         'lr': trial.suggest_float("lr", 1e-6, 1e-4, log=True),
-        'batch_size': trial.suggest_categorical("batch_size", [4, 8, 16]),
+        'batch_size': trial.suggest_categorical("batch_size", [8, 16, 32]),
         'accumulation_steps': trial.suggest_categorical("accumulation_steps", [2, 4, 8]),
         'weight_decay': trial.suggest_float("weight_decay", 0.0, 0.1),
         'warmup_ratio': trial.suggest_float("warmup_ratio", 0.05, 0.2),
@@ -218,16 +372,16 @@ def objective(trial: optuna.Trial, train_csv: str, valid_csv: str) -> float:
         'clip_grad_norm': trial.suggest_float("clip_grad_norm", 0.5, 2.0)
     }
 
-    logger.info(f"Trial {trial.number}: {hp_config}")
-
     if USE_CROSS_VALIDATION:
         df_train = pd.read_csv(train_csv)
+        from sklearn.preprocessing import LabelEncoder
+        labelencoder = LabelEncoder()
+        df_train["label"] = labelencoder.fit_transform(df_train["Sentiment"])
+
         kf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
         cv_scores = []
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(df_train, df_train['label'])):
-            logger.info(f"  Fold {fold + 1}/{N_FOLDS}")
-
             temp_dir = Path('temp')
             temp_dir.mkdir(exist_ok=True)
 
@@ -253,10 +407,7 @@ def objective(trial: optuna.Trial, train_csv: str, valid_csv: str) -> float:
                 clear_gpu_memory()
 
         mean_cv_score = float(np.mean(cv_scores))
-        std_cv_score = np.std(cv_scores)
-        logger.info(f"  CV Score: {mean_cv_score:.4f} ± {std_cv_score:.4f}")
         return mean_cv_score
-
     else:
         return train_fold(train_csv, valid_csv, hp_config, trial, fold=0)
 
@@ -269,16 +420,18 @@ def train_fold(
         fold: int
 ) -> float:
     try:
+        accelerator = Accelerator(mixed_precision='fp16', log_with=None)
+
         train_dl, valid_dl, _, class_weights = prepare_dataloaders(
             train_csv, valid_csv, MODEL_NAME,
             hp_config['batch_size'], MAX_LENGTH,
             augment_prob=hp_config['augment_prob']
         )
 
-        class_weights = class_weights.to(DEVICE)
+        class_weights = class_weights.to(accelerator.device)
         loss_fn = FocalLoss(alpha=class_weights, gamma=hp_config['gamma'])
 
-        model = BertForSequenceClassification.from_pretrained(
+        model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_NAME,
             num_labels=NUM_CLASSES,
             hidden_dropout_prob=hp_config['dropout_rate'],
@@ -293,11 +446,8 @@ def train_fold(
             bias="none",
             target_modules=["query", "value"]
         )
-        model = get_peft_model(model, lora_config)
-        model = model.to(DEVICE)
 
-        if hasattr(model, 'gradient_checkpointing_enable'):
-            model.gradient_checkpointing_enable()
+        model = get_peft_model(model, lora_config)
 
         optimizer = AdamW(
             model.parameters(),
@@ -306,8 +456,8 @@ def train_fold(
             eps=hp_config['eps']
         )
 
-        total_steps = (len(train_dl) // hp_config['accumulation_steps']) * EPOCHS
-        warmup_steps = int(total_steps * hp_config['warmup_ratio'])
+        total_steps = math.ceil(len(train_dl) / hp_config['accumulation_steps']) * EPOCHS
+        warmup_steps = max(1, int(total_steps * hp_config['warmup_ratio']))
 
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
@@ -315,22 +465,27 @@ def train_fold(
             num_training_steps=total_steps
         )
 
-        scaler = GradScaler(init_scale=2.**16)
+        model, optimizer, train_dl, valid_dl, scheduler, loss_fn = accelerator.prepare(
+            model, optimizer, train_dl, valid_dl, scheduler, loss_fn
+        )
 
         best_accuracy = 0
         no_improve_count = 0
 
         for epoch in range(EPOCHS):
             train_loss = train_epoch(
-                model, train_dl, loss_fn, optimizer, scheduler, scaler,
+                model, train_dl, optimizer, scheduler, loss_fn,
                 hp_config['accumulation_steps'], hp_config['clip_grad_norm'],
-                epoch=epoch
+                epoch=epoch, accelerator=accelerator
             )
 
-            true_labels, predictions, _, val_loss = eval_model(model, valid_dl, loss_fn, epoch=epoch)
-            accuracy = accuracy_score(true_labels, predictions)
+            true_labels, predictions, _, val_loss = eval_model(
+                model, valid_dl, loss_fn, epoch=epoch, accelerator=accelerator
+            )
 
+            accuracy = accuracy_score(true_labels, predictions)
             trial.report(accuracy, epoch)
+
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
 
@@ -341,25 +496,19 @@ def train_fold(
                 no_improve_count += 1
 
             if no_improve_count >= EARLY_STOPPING_PATIENCE:
-                logger.info(f"    Early stopping at epoch {epoch + 1}")
                 break
 
         return best_accuracy
 
-    except Exception as e:
-        logger.error(f"Error in fold {fold}: {str(e)}")
+    except Exception as exc:
+        logger.error(f"Error in fold {fold}: {str(exc)}")
         raise
 
     finally:
-        # Cleanup
-        if 'model' in locals():
-            del model
-        if 'optimizer' in locals():
-            del optimizer
-        if 'scheduler' in locals():
-            del scheduler
-        if 'scaler' in locals():
-            del scaler
+        locals_to_del = ['model', 'optimizer', 'scheduler', 'accelerator']
+        for var_name in locals_to_del:
+            if var_name in locals():
+                del locals()[var_name]
         clear_gpu_memory()
 
 
@@ -372,8 +521,8 @@ def plot_visualizations(
 
     report = classification_report(
         true_labels, predictions,
-        target_names=['Bearish', 'Bullish', 'Neutral'],
-        output_dict=True
+        target_names = ['Negative', 'Neutral', 'Positive'],
+        output_dict = True
     )
 
     with open(output_dir / 'classification_report.json', 'w') as f:
@@ -382,15 +531,15 @@ def plot_visualizations(
     print("\nClassification Report:")
     print(classification_report(
         true_labels, predictions,
-        target_names=['Bearish', 'Bullish', 'Neutral']
+        target_names = ['Negative', 'Neutral', 'Positive']
     ))
 
     cm = confusion_matrix(true_labels, predictions)
     plt.figure(figsize=(8, 6))
     sns.heatmap(
         cm, annot=True, fmt='d', cmap='Blues',
-        xticklabels=['Bearish', 'Bullish', 'Neutral'],
-        yticklabels=['Bearish', 'Bullish', 'Neutral']
+        xticklabels=['Negative', 'Neutral', 'Positive'],
+        yticklabels=['Negative', 'Neutral', 'Positive']
     )
     plt.title('Confusion Matrix')
     plt.xlabel('Predicted')
@@ -411,14 +560,13 @@ def plot_roc_curves(
     n_classes = true_labels_bin.shape[1]
 
     fpr, tpr, roc_auc = {}, {}, {}
-
     for i in range(n_classes):
         fpr[i], tpr[i], _ = roc_curve(true_labels_bin[:, i], predictions_prob[:, i])
         roc_auc[i] = auc(fpr[i], tpr[i])
 
     plt.figure(figsize=(10, 8))
     colors = ['aqua', 'darkorange', 'cornflowerblue']
-    class_names = ['Bearish', 'Bullish', 'Neutral']
+    class_names = ['Negative', 'Neutral', 'Positive']
 
     for i, color in zip(range(n_classes), colors):
         plt.plot(
@@ -474,8 +622,8 @@ def visualize_attention(
             plt.savefig(output_dir / f'attention_heatmap_{i + 1}.png', dpi=100, bbox_inches='tight')
             plt.close()
 
-        except Exception as e:
-            logger.error(f"Error visualizing attention for sentence {i + 1}: {str(e)}")
+        except Exception as exc:
+            logger.error(f"Error visualizing attention for sentence {i + 1}: {str(exc)}")
 
 
 def save_model_artifacts(
@@ -497,7 +645,6 @@ def save_model_artifacts(
         json.dump(training_history, f, indent=2)
 
     model.config.to_json_file(output_dir / 'config.json')
-
     logger.info(f"Model artifacts saved to {output_dir}")
 
 
@@ -508,30 +655,57 @@ def export_to_onnx(
 ) -> None:
     try:
         onnx_path = output_dir / 'model.onnx'
-
         dummy_input = torch.zeros(1, max_length, dtype=torch.long).to(DEVICE)
         dummy_attention_mask = torch.ones(1, max_length, dtype=torch.long).to(DEVICE)
+        model.eval()
+        orig_return_dict = getattr(model.config, "return_dict", True)
+        model.config.return_dict = False
 
-        torch.onnx.export(
-            model,
-            (dummy_input, dummy_attention_mask),
-            onnx_path,
-            input_names=['input_ids', 'attention_mask'],
-            output_names=['logits'],
-            dynamic_axes={
-                'input_ids': {0: 'batch_size', 1: 'sequence'},
-                'attention_mask': {0: 'batch_size', 1: 'sequence'},
-                'logits': {0: 'batch_size'}
-            },
-            opset_version=14,
-            export_params=True,
-            do_constant_folding=True
-        )
-
+        with torch.no_grad():
+            torch.onnx.export(
+                model,
+                (dummy_input, dummy_attention_mask),
+                onnx_path,
+                input_names = ['input_ids', 'attention_mask'],
+                output_names = ['logits'],
+                dynamic_axes = {
+                    'input_ids': {0: 'batch_size', 1: 'sequence'},
+                    'attention_mask': {0: 'batch_size', 1: 'sequence'},
+                    'logits': {0: 'batch_size'}
+                },
+                opset_version = 14,
+                export_params = True,
+                do_constant_folding = True
+            )
+        model.config.return_dict = orig_return_dict
         logger.info(f"ONNX model saved to {onnx_path}")
 
-    except Exception as e:
-        logger.error(f"Failed to export ONNX model: {str(e)}")
+    except Exception as exc:
+        logger.error(f"Failed to export ONNX model: {str(exc)}")
+
+
+def plot_comparison(models_df: pd.DataFrame, transformer_acc: float, output_dir: Path):
+    transformer_row = pd.DataFrame([{'Models': 'FinBERT', 'Accuracy Scores': transformer_acc}])
+    models_df = pd.concat([models_df, transformer_row], ignore_index=True)
+    models_df = models_df.sort_values('Accuracy Scores', ascending=False)
+
+    plt.rcParams['figure.figsize'] = 22, 10
+    sns.set_style("darkgrid")
+    ax = sns.barplot(x=models_df["Models"], y=models_df["Accuracy Scores"], palette="coolwarm", saturation=1.5)
+    plt.xlabel("Classification Models", fontsize=20)
+    plt.ylabel("Accuracy", fontsize=20)
+    plt.title("Accuracy of different Classification Models", fontsize=20)
+    plt.xticks(fontsize=11, horizontalalignment='center', rotation=8)
+    plt.yticks(fontsize=13)
+
+    for p in ax.patches:
+        if isinstance(p, patches.Rectangle):
+            width, height = p.get_width(), p.get_height()
+            x, y = p.get_xy()
+            ax.annotate(f'{height:.2%}', (x + width / 2, y + height * 1.02), ha='center', fontsize='x-large')
+
+    plt.savefig(output_dir / 'model_comparison.png', dpi=100)
+    plt.close()
 
 
 def setup_paths():
@@ -543,23 +717,22 @@ def setup_paths():
         raise FileNotFoundError(f"Dataset files not found in {base_dir / 'dataset'}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     return train_csv, valid_csv
 
 
 def optimize_hyperparameters(train_csv: str, valid_csv: str):
     from optuna.trial import TrialState
-
     logger.info("=" * 50)
     logger.info("Starting hyperparameter optimization with Optuna...")
     logger.info("=" * 50)
 
-    storage = f"sqlite:///{OUTPUT_DIR / 'optuna_study.db'}"
-    study_name = "financial_sentiment_optimization"
+    sig = _space_signature()
+    study_name = f"financial_sentiment_optimization__{sig}"
+    storage = f"sqlite:///{OUTPUT_DIR / f'optuna_study__{sig}.db'}"
 
     try:
         study = optuna.load_study(study_name=study_name, storage=storage)
-    except KeyError:
+    except Exception:
         study = optuna.create_study(
             study_name=study_name,
             storage=storage,
@@ -569,53 +742,24 @@ def optimize_hyperparameters(train_csv: str, valid_csv: str):
             load_if_exists=True
         )
 
-    running_trials = study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
-    for trial in running_trials:
-        logger.info(f"Failing incomplete running trial {trial.number}")
-        study.tell(trial.number, state=TrialState.FAIL)
+    running = study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
+    for t in running:
+        study.tell(t.number, state=TrialState.FAIL)
 
-    completed_trials = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
-    pruned_trials = study.get_trials(deepcopy=False, states=(TrialState.PRUNED,))
-    failed_trials = study.get_trials(deepcopy=False, states=(TrialState.FAIL,))
-    running_trials = study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
+    completed = study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+    remaining = max(N_TRIALS - len(completed), 0)
 
-    logger.info(
-        f"Study status: "
-        f"{len(completed_trials)} completed, {len(pruned_trials)} pruned, "
-        f"{len(failed_trials)} failed, {len(running_trials)} running."
-    )
-
-    completed_count = len(completed_trials)
-    remaining_trials = max(N_TRIALS - completed_count, 0)
-    last_number = max([t.number for t in study.trials], default=-1)
-
-    if remaining_trials > 0:
-        logger.info(
-            f"{completed_count} trials completed out of target {N_TRIALS}. "
-            f"Scheduling {remaining_trials} more. Next trial number will start at {last_number + 1}."
-        )
-        study.optimize(
-            lambda t: objective(t, train_csv, valid_csv),
-            n_trials=remaining_trials,
-            timeout=3600 * 6,
-            gc_after_trial=True
-        )
-    else:
-        logger.info(
-            f"{completed_count} trials completed. Target {N_TRIALS} already reached. Skipping optimization."
-        )
+    if remaining > 0:
+        study.optimize(lambda trl: objective(trl, train_csv, valid_csv),
+                       n_trials=remaining, timeout=3600 * 6, gc_after_trial=True)
 
     logger.info("=" * 50)
     logger.info("Optimization finished.")
     logger.info(f"Best trial: {study.best_trial.number}")
     logger.info(f"Best validation accuracy: {study.best_trial.value:.4f}")
-    logger.info("Best hyperparameters:")
-    for key, value in study.best_trial.params.items():
-        logger.info(f"  {key}: {value}")
 
     study_df = study.trials_dataframe()
-    study_df.to_csv(OUTPUT_DIR / 'optuna_study_results.csv', index=False)
-
+    study_df.to_csv(OUTPUT_DIR / f'optuna_study_results__{sig}.csv', index=False)
     return study
 
 
@@ -632,10 +776,12 @@ def train_final_model(study, train_csv: str, valid_csv: str):
         augment_prob=best_params.get('augment_prob', 0.3)
     )
 
-    class_weights = class_weights.to(DEVICE)
+    accelerator = Accelerator(mixed_precision='fp16', log_with=None)
+
+    class_weights = class_weights.to(accelerator.device)
     loss_fn = FocalLoss(alpha=class_weights, gamma=best_params.get('gamma', 2.0))
 
-    model = BertForSequenceClassification.from_pretrained(
+    model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME,
         num_labels=NUM_CLASSES,
         hidden_dropout_prob=best_params.get('dropout_rate', 0.1),
@@ -647,9 +793,10 @@ def train_final_model(study, train_csv: str, valid_csv: str):
         r=best_params.get('lora_r', 8),
         lora_alpha=32,
         lora_dropout=best_params.get('dropout_rate', 0.1),
+        target_modules=["query", "value"]
     )
+
     model = get_peft_model(model, lora_config)
-    model.to(DEVICE)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -658,43 +805,52 @@ def train_final_model(study, train_csv: str, valid_csv: str):
         eps=best_params.get('eps', 1e-8)
     )
 
-    total_steps = len(train_dl) * EPOCHS // best_params.get('accumulation_steps', 1)
+    total_steps = math.ceil(len(train_dl) / best_params.get('accumulation_steps', 1)) * EPOCHS
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(total_steps * best_params.get('warmup_ratio', 0.1)),
         num_training_steps=total_steps
     )
 
+    model, optimizer, train_dl, valid_dl, scheduler, loss_fn = accelerator.prepare(
+        model, optimizer, train_dl, valid_dl, scheduler, loss_fn
+    )
+
     best_val_acc = -1.0
     epochs_no_improve = 0
-    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     for epoch in range(1, EPOCHS + 1):
         start_time = time.time()
+
         train_loss = train_epoch(
-            model, train_dl, loss_fn, optimizer, scheduler, scaler,
+            model, train_dl, optimizer, scheduler, loss_fn,
             accumulation_steps=best_params.get('accumulation_steps', 1),
             clip_grad_norm=best_params.get('clip_grad_norm', 1.0),
-            epoch=epoch-1
+            epoch=epoch - 1,
+            accelerator=accelerator
         )
-        true_labels, predictions, _, val_loss = eval_model(model, valid_dl, loss_fn, epoch=epoch-1)
-        val_acc = accuracy_score(true_labels, predictions)
 
+        true_labels, predictions, _, val_loss = eval_model(
+            model, valid_dl, loss_fn, epoch=epoch - 1, accelerator=accelerator
+        )
+
+        val_acc = accuracy_score(true_labels, predictions)
         elapsed = time.time() - start_time
+
         logger.info(
             f"\nEpoch {epoch}/{EPOCHS}\n"
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Val Acc: {val_acc:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | "
-            f"Time: {int(elapsed//60)}m {int(elapsed%60)}s"
+            f"Time: {int(elapsed // 60)}m {int(elapsed % 60)}s"
         )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             epochs_no_improve = 0
+            unwrapped_model = accelerator.unwrap_model(model)
             save_model_artifacts(
-                model=model,
+                model=unwrapped_model,
                 tokenizer=tokenizer,
                 best_params=best_params,
                 training_history={},
@@ -703,19 +859,22 @@ def train_final_model(study, train_csv: str, valid_csv: str):
             logger.info("New best model saved.")
         else:
             epochs_no_improve += 1
+            if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
+                logger.info(f"Early stopping at epoch {epoch}")
+                break
 
-        if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
-            logger.info(f"Early stopping at epoch {epoch}")
-            break
+    unwrapped_model = accelerator.unwrap_model(model)
+    export_to_onnx(unwrapped_model, OUTPUT_DIR)
 
-    export_to_onnx(model, OUTPUT_DIR)
-
-    return model, test_dl, loss_fn, tokenizer
+    return unwrapped_model, test_dl, loss_fn, tokenizer
 
 
-def perform_evaluation_and_visualizations(model, test_dl, loss_fn, tokenizer, output_dir: Path):
+def perform_evaluation_and_visualizations(model, test_dl, loss_fn, tokenizer, output_dir: Path,
+                                          models_df: pd.DataFrame):
     true_labels, predictions, probs, _ = eval_model(model, test_dl, loss_fn)
+    transformer_acc = accuracy_score(true_labels, predictions)
 
+    plot_comparison(models_df, transformer_acc, output_dir)
     plot_visualizations(true_labels, predictions, output_dir)
     plot_roc_curves(true_labels, probs, output_dir)
 
@@ -725,20 +884,36 @@ def perform_evaluation_and_visualizations(model, test_dl, loss_fn, tokenizer, ou
         "$CX - Cemex cut at Credit Suisse, J.P. Morgan on weak building outlook",
         "Adobe price target raised to $350 vs. $320 at Canaccord"
     ]
-    visualize_attention(model, tokenizer, sample_texts, output_dir)
 
+    visualize_attention(model, tokenizer, sample_texts, output_dir)
     logger.info(f"\nModel and visualizations saved in '{output_dir}' directory.")
 
 
 def main():
+    cfg = model_config()
     train_csv, valid_csv = setup_paths()
+
+    df = preprocess_csv(cfg.data_path)
+    perform_eda(df, OUTPUT_DIR)
+
+    models_df = ml_based_approach(df)
 
     study = optimize_hyperparameters(str(train_csv), str(valid_csv))
 
     model, test_dl, loss_fn, tokenizer = train_final_model(study, str(train_csv), str(valid_csv))
 
-    perform_evaluation_and_visualizations(model, test_dl, loss_fn, tokenizer, OUTPUT_DIR)
+    perform_evaluation_and_visualizations(model, test_dl, loss_fn, tokenizer, OUTPUT_DIR, models_df)
 
 
 if __name__ == '__main__':
-    main()
+    import multiprocessing as mp
+
+    mp.set_start_method('spawn', force=True)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Training interrupted by user")
+    except Exception as e:
+        logger.error(f"Training failed with error: {e}")
+        raise
